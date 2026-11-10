@@ -82,9 +82,33 @@ async function runMigration() {
       return String(name).trim().toLowerCase();
     }
 
+    // Legacy lookup name -> target lookup name, for cases where the concept is
+    // the same but the target uses a different word/spacing/plural.
+    // Keys are normalized (trim + lowercase) to match normalizeName().
+    const lookupAliases = {
+      product_type: {
+        "pots / pans": "pot & pans",
+        decoration: "decorations",
+        topperware: "toppersware",
+        "gel pen": "gelpen",
+      },
+      product_category: {},
+      classification: {
+        deskfan: "desk fan",
+        standfan: "stand fan",
+        wallfan: "wall fan",
+        flowers: "flower",
+      },
+      price: {},
+      unit_of_measure: {},
+    };
+
+    // Every lookup table in this schema has a status column (see SHOW COLUMNS).
+    // We only want to link freshly migrated products to ACTIVE rows, otherwise
+    // ORDER BY record_id may pick an inactive duplicate as the winner.
     async function loadNameMap(tableName) {
       const [rows] = await targetDb.execute(
-        `SELECT record_id, name FROM ${tableName} ORDER BY record_id`,
+        `SELECT record_id, name FROM ${tableName} WHERE status = 1 ORDER BY record_id`,
       );
       const map = new Map();
       for (const row of rows) {
@@ -97,8 +121,15 @@ async function runMigration() {
 
     function resolveUuid(map, tableName, name, context) {
       if (name != null) {
-        const id = map.get(normalizeName(name));
+        const key = normalizeName(name);
+        let id = map.get(key);
         if (id) return id;
+
+        const aliasTarget = lookupAliases[tableName]?.[key];
+        if (aliasTarget) {
+          id = map.get(normalizeName(aliasTarget));
+          if (id) return id;
+        }
       }
 
       if (!allowFallback) {
