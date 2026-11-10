@@ -48,7 +48,7 @@ async function runMigration() {
     await targetDb.beginTransaction();
 
     // ----------------------------------------------------
-    // HELPERS: Batch + lookup utilities (no more per-row queries)
+    // HELPERS: Batch + lookup utilities
     // ----------------------------------------------------
     function chunk(array, size) {
       const chunks = [];
@@ -58,8 +58,6 @@ async function runMigration() {
       return chunks;
     }
 
-    // Preload a lookup table (record_id, name) into a Map, ordered by
-    // record_id so the "first row" fallback keeps its old meaning.
     async function loadNameMap(tableName) {
       const [rows] = await targetDb.execute(
         `SELECT record_id, name FROM ${tableName} ORDER BY record_id`,
@@ -71,10 +69,6 @@ async function runMigration() {
       return map;
     }
 
-    // Resolve a relational UUID from a preloaded Map.
-    // Strict by default: a missing name ABORTS the migration instead of
-    // silently linking to an unrelated row.
-    // With --allow-fallback it logs a loud warning and uses the first row.
     function resolveUuid(map, tableName, name, context) {
       if (name) {
         const id = map.get(name);
@@ -128,8 +122,6 @@ async function runMigration() {
       `[Migration] Found ${soldProducts.length} unique products with sales history for this store. Provisioning catalog...`,
     );
 
-    // Preload existing target products + all lookup tables ONCE.
-    // This replaces the per-row SELECTs (the N+1 problem).
     const productIdByCode = new Map();
     if (soldProducts.length > 0) {
       const placeholders = soldProducts.map(() => "?").join(",");
@@ -145,8 +137,6 @@ async function runMigration() {
     const classMap = await loadNameMap("classification");
     const typeMap = await loadNameMap("product_type");
 
-    // Resolve all FK lookups BEFORE inserting anything, so a bad name
-    // aborts the whole migration cleanly instead of half-applying.
     const productsToInsert = soldProducts
       .filter((item) => !productIdByCode.has(item.product_code))
       .map((item) => {
@@ -180,6 +170,7 @@ async function runMigration() {
 
     let productsCreated = 0;
     for (const batch of chunk(productsToInsert, BATCH_SIZE)) {
+      if (batch.length === 0) continue;
       const placeholders = batch
         .map(() => "(?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW(), NOW())")
         .join(",");
@@ -247,7 +238,7 @@ async function runMigration() {
     const pricingRows = [];
     for (const item of legacyPricing) {
       const productUuid = productIdByCode.get(item.product_code);
-      if (!productUuid) continue; // safety net: product was never provisioned
+      if (!productUuid) continue;
 
       pricingRows.push({
         record_id: crypto.randomUUID(),
@@ -273,6 +264,7 @@ async function runMigration() {
 
     let pricingSynced = 0;
     for (const batch of chunk(pricingRows, BATCH_SIZE)) {
+      if (batch.length === 0) continue;
       const placeholders = batch
         .map(() => "(?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())")
         .join(",");
@@ -336,7 +328,7 @@ async function runMigration() {
     const stockRows = [];
     for (const stock of legacyStocks) {
       const productUuid = productIdByCode.get(stock.product_code);
-      if (!productUuid) continue; // safety net
+      if (!productUuid) continue;
 
       stockRows.push({
         record_id: crypto.randomUUID(),
@@ -349,6 +341,7 @@ async function runMigration() {
 
     let stocksSynced = 0;
     for (const batch of chunk(stockRows, BATCH_SIZE)) {
+      if (batch.length === 0) continue;
       const placeholders = batch
         .map(() => "(?, ?, ?, ?, ?, NOW(), NOW(), NOW())")
         .join(",");
@@ -392,17 +385,14 @@ async function runMigration() {
       console.log("✨ LIVE MIGRATION COMMITTED SUCCESSFULLY.");
     }
   } catch (error) {
-    console.error(
-      "[Error] Migration failed, rolling back transaction...",
-      error,
-    );
+    console.error("\n[Error] Migration failed. Details below:");
+    console.error(error); // Prints full stack trace and MySQL error details
     try {
       await targetDb.rollback();
-      console.error("[Error] Transaction rolled back.");
+      console.error("[Migration] Transaction successfully rolled back.");
     } catch (rollbackError) {
       console.error("[Error] Rollback also failed:", rollbackError);
     }
-    // Rethrow so the process exits with a non-zero code (CI-safe).
     throw error;
   } finally {
     await legacyDb.end();
@@ -410,7 +400,7 @@ async function runMigration() {
   }
 }
 
-runMigration().catch(() => {
-  console.error("[Error] Migration failed - exiting with code 1.");
+runMigration().catch((error) => {
+  console.error("\n[Fatal Error] Process terminated with exit code 1.");
   process.exit(1);
 });
