@@ -25,8 +25,19 @@ async function runMigration() {
     console.log("--------------------------------------------------");
   }
 
+  const legacyPort = Number(process.env.DB_PORT) || 3306;
+  const targetPort = Number(process.env.DB_TARGET_PORT) || 3306;
+
+  if (!Number.isInteger(legacyPort) || !Number.isInteger(targetPort)) {
+    console.error(
+      "[Error] Invalid DB_PORT / DB_TARGET_PORT in .env. Ports must be integers.",
+    );
+    process.exit(1);
+  }
+
   const legacyDb = await mysql.createConnection({
     host: process.env.DB_HOST,
+    port: legacyPort,
     user: process.env.DB_USERNAME,
     password: process.env.DB_PASSWORD,
     database: process.env.DB_DATABASE,
@@ -34,6 +45,7 @@ async function runMigration() {
 
   const targetDb = await mysql.createConnection({
     host: process.env.DB_TARGET_HOST,
+    port: targetPort,
     user: process.env.DB_TARGET_USERNAME,
     password: process.env.DB_TARGET_PASSWORD,
     database: process.env.DB_TARGET_DATABASE,
@@ -42,6 +54,12 @@ async function runMigration() {
   try {
     console.log(
       `[Migration] Starting transaction-driven sync for Legacy Store ID: ${sourceStoreId} -> Target Store UUID: ${targetStoreUuid}`,
+    );
+    console.log(
+      `[Migration] Legacy DB: ${process.env.DB_HOST}:${legacyPort}/${process.env.DB_DATABASE}`,
+    );
+    console.log(
+      `[Migration] Target DB: ${process.env.DB_TARGET_HOST}:${targetPort}/${process.env.DB_TARGET_DATABASE}`,
     );
 
     // Start database transaction on target DB
