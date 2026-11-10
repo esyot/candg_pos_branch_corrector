@@ -401,6 +401,6 @@ async function runMigration() {
 }
 
 runMigration().catch((error) => {
-  console.error("\n[Fatal Error] Process terminated with exit code 1.");
+  console.error("\n[FATAL ERROR TRACE]:", error);
   process.exit(1);
 });
