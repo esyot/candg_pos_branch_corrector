@@ -76,20 +76,28 @@ async function runMigration() {
       return chunks;
     }
 
+    // Normalize lookup keys so trailing spaces / casing drift don't break matches.
+    function normalizeName(name) {
+      if (name == null) return null;
+      return String(name).trim().toLowerCase();
+    }
+
     async function loadNameMap(tableName) {
       const [rows] = await targetDb.execute(
         `SELECT record_id, name FROM ${tableName} ORDER BY record_id`,
       );
       const map = new Map();
       for (const row of rows) {
-        if (!map.has(row.name)) map.set(row.name, row.record_id);
+        if (row.name == null) continue;
+        const key = normalizeName(row.name);
+        if (!map.has(key)) map.set(key, row.record_id);
       }
       return map;
     }
 
     function resolveUuid(map, tableName, name, context) {
-      if (name) {
-        const id = map.get(name);
+      if (name != null) {
+        const id = map.get(normalizeName(name));
         if (id) return id;
       }
 
