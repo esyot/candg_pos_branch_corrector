@@ -3,18 +3,23 @@ const mysql = require("mysql2/promise");
 
 const norm = (n) => (n == null ? null : String(n).trim().toLowerCase());
 
-// Known renames: legacy name -> target name (normalized keys handled by norm()).
-// Fill in / adjust after reviewing diff output.
+// Known renames: legacy name -> target name. Keys must be normalized (lowercase, trimmed).
 const ALIASES = {
   product_type: {
     "pots / pans": "pot & pans",
-    topperware: "toppersware",
     decoration: "decorations",
+    topperware: "toppersware",
     "gel pen": "gelpen",
-    steel: "steel", // exact already, kept for clarity
-    "sunny ware": "sunnyware",
-    sunnyware: "sunnyware",
   },
+  product_category: {},
+  classification: {
+    deskfan: "desk fan",
+    standfan: "stand fan",
+    wallfan: "wall fan",
+    flowers: "flower",
+  },
+  price: {},
+  unit_of_measure: {},
 };
 
 async function main() {
@@ -43,8 +48,7 @@ async function main() {
             FROM product p
             LEFT JOIN product_type pt ON p.product_type = pt.record_id
             WHERE p.product_code IN (
-              SELECT p_sub.product_code
-              FROM sales_order so_sub
+              SELECT p_sub.product_code FROM sales_order so_sub
               JOIN sales_order_details sod_sub ON so_sub.record_id = sod_sub.sales_order
               JOIN product p_sub ON sod_sub.product = p_sub.record_id
               WHERE so_sub.store = ?
@@ -57,8 +61,7 @@ async function main() {
             FROM product p
             LEFT JOIN product_category pc ON p.category = pc.record_id
             WHERE p.product_code IN (
-              SELECT p_sub.product_code
-              FROM sales_order so_sub
+              SELECT p_sub.product_code FROM sales_order so_sub
               JOIN sales_order_details sod_sub ON so_sub.record_id = sod_sub.sales_order
               JOIN product p_sub ON sod_sub.product = p_sub.record_id
               WHERE so_sub.store = ?
@@ -71,8 +74,7 @@ async function main() {
             FROM product p
             LEFT JOIN classification c ON p.classification = c.record_id
             WHERE p.product_code IN (
-              SELECT p_sub.product_code
-              FROM sales_order so_sub
+              SELECT p_sub.product_code FROM sales_order so_sub
               JOIN sales_order_details sod_sub ON so_sub.record_id = sod_sub.sales_order
               JOIN product p_sub ON sod_sub.product = p_sub.record_id
               WHERE so_sub.store = ?
@@ -84,13 +86,11 @@ async function main() {
       sql: `SELECT DISTINCT pr.name AS name
             FROM pricing_scheme ps
             LEFT JOIN price pr ON ps.price = pr.record_id
-            WHERE ps.store = ?
-              AND ps.product IN (
-                SELECT sod_sub.product
-                FROM sales_order so_sub
-                JOIN sales_order_details sod_sub ON so_sub.record_id = sod_sub.sales_order
-                WHERE so_sub.store = ?
-              )`,
+            WHERE ps.store = ? AND ps.product IN (
+              SELECT sod_sub.product FROM sales_order so_sub
+              JOIN sales_order_details sod_sub ON so_sub.record_id = sod_sub.sales_order
+              WHERE so_sub.store = ?
+            )`,
       params: [store, store],
     },
     {
@@ -99,30 +99,38 @@ async function main() {
       sql: `SELECT DISTINCT uom.name AS name
             FROM pricing_scheme ps
             LEFT JOIN unit_of_measure uom ON ps.uom = uom.record_id
-            WHERE ps.store = ?
-              AND ps.product IN (
-                SELECT sod_sub.product
-                FROM sales_order so_sub
-                JOIN sales_order_details sod_sub ON so_sub.record_id = sod_sub.sales_order
-                WHERE so_sub.store = ?
-              )`,
+            WHERE ps.store = ? AND ps.product IN (
+              SELECT sod_sub.product FROM sales_order so_sub
+              JOIN sales_order_details sod_sub ON so_sub.record_id = sod_sub.sales_order
+              WHERE so_sub.store = ?
+            )`,
       params: [store, store],
     },
   ];
 
   for (const { label, targetTable, sql, params } of lookups) {
     const [legacyRows] = await legacy.execute(sql, params ?? [store]);
-    const [targetRows] = await target.execute(
-      `SELECT name FROM ${targetTable}`,
+
+    const [activeRows] = await target.execute(
+      `SELECT name FROM ${targetTable} WHERE status = 1`,
+    );
+    const [allRows] = await target.execute(
+      `SELECT name, status FROM ${targetTable}`,
     );
 
-    const targetSet = new Set(
-      targetRows.map((r) => norm(r.name)).filter(Boolean),
+    const activeSet = new Set(
+      activeRows.map((r) => norm(r.name)).filter(Boolean),
     );
+    const inactiveOnlySet = new Set();
+    for (const r of allRows) {
+      const k = norm(r.name);
+      if (!k) continue;
+      if (!activeSet.has(k)) inactiveOnlySet.add(k);
+    }
 
-    const insert = [];
+    const missingEntirely = [];
+    const inactiveOnly = [];
     const alias = [];
-    const unresolved = [];
 
     const seen = new Set();
     for (const row of legacyRows) {
@@ -131,39 +139,34 @@ async function main() {
       if (key == null || seen.has(key)) continue;
       seen.add(key);
 
-      if (targetSet.has(key)) continue; // exact (normalized) match
+      if (activeSet.has(key)) continue;
 
       const aliasTo = ALIASES[label]?.[key];
-      if (aliasTo && targetSet.has(norm(aliasTo))) {
+      if (aliasTo && activeSet.has(norm(aliasTo))) {
         alias.push({ from: raw, to: aliasTo });
-      } else {
-        unresolved.push(raw);
+        continue;
       }
+
+      if (inactiveOnlySet.has(key)) inactiveOnly.push(raw);
+      else missingEntirely.push(raw);
     }
 
     console.log(`\n=== ${label} (target table: ${targetTable}) ===`);
     console.log(`  legacy distinct: ${seen.size}`);
     console.log(
-      `  exact (normalized) matches: ${seen.size - alias.length - unresolved.length}`,
+      `  active exact matches: ${seen.size - alias.length - inactiveOnly.length - missingEntirely.length}`,
     );
     console.log(`  alias-mapped: ${alias.length}`);
     for (const a of alias)
       console.log(`    ~ ${JSON.stringify(a.from)} -> ${JSON.stringify(a.to)}`);
-    console.log(`  missing (need insert or alias): ${unresolved.length}`);
-    for (const u of unresolved.sort())
+    console.log(
+      `  only-inactive in target (flip status=1 or alias): ${inactiveOnly.length}`,
+    );
+    for (const u of inactiveOnly.sort())
       console.log(`    - ${JSON.stringify(u)}`);
-
-    if (unresolved.length) {
-      const valuesSql = unresolved
-        .map((u) => `(UUID(), '${u.replace(/'/g, "''")}')`)
-        .join(",\n  ");
-      console.log(
-        `\n  -- INSERT into ${targetTable} (TARGET DB, port ${process.env.DB_TARGET_PORT}):`,
-      );
-      console.log(
-        `  INSERT INTO ${targetTable} (record_id, name) VALUES\n  ${valuesSql};\n`,
-      );
-    }
+    console.log(`  missing entirely (INSERT): ${missingEntirely.length}`);
+    for (const u of missingEntirely.sort())
+      console.log(`    - ${JSON.stringify(u)}`);
   }
 
   await legacy.end();
