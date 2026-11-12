@@ -1,8 +1,204 @@
 require("dotenv").config();
 const mysql = require("mysql2/promise");
 const crypto = require("crypto");
+const { execSync } = require("child_process");
 
 const BATCH_SIZE = 500;
+
+/* ------------------------------------------------------------------ */
+/* Pre-flight / post-flight helpers                                   */
+/* ------------------------------------------------------------------ */
+
+const SYNC_TABLES = ["product", "pricing_scheme", "stocks_on_hand"];
+
+/**
+ * Verify that every sync table on the target has all 3 triggers
+ * (INSERT, UPDATE, DELETE). If any are missing, inserts from this
+ * migration will NOT be logged and will NOT propagate to other nodes.
+ *
+ * Throws if the target is not safe to write to.
+ */
+async function verifyTargetTriggers(targetDb) {
+  console.log("[Preflight] Checking sync triggers on target...");
+  const problems = [];
+
+  for (const table of SYNC_TABLES) {
+    const [rows] = await targetDb.execute(
+      `SELECT TRIGGER_NAME, EVENT_MANIPULATION
+       FROM information_schema.TRIGGERS
+       WHERE TRIGGER_SCHEMA = DATABASE()
+         AND TRIGGER_NAME IN (?, ?, ?)`,
+      [
+        `sym_trig_${table}_ins`,
+        `sym_trig_${table}_upd`,
+        `sym_trig_${table}_del`,
+      ],
+    );
+
+    const found = new Set(rows.map((r) => r.TRIGGER_NAME));
+    const expected = [
+      `sym_trig_${table}_ins`,
+      `sym_trig_${table}_upd`,
+      `sym_trig_${table}_del`,
+    ];
+    const missing = expected.filter((t) => !found.has(t));
+
+    if (missing.length === 0) {
+      console.log(`  ✅ ${table}: 3/3 triggers`);
+    } else {
+      console.error(`  ❌ ${table}: missing ${missing.join(", ")}`);
+      problems.push(`${table}: missing ${missing.join(", ")}`);
+    }
+  }
+
+  if (problems.length > 0) {
+    throw new Error(
+      `\n[Preflight FAILED] Target is missing sync triggers.\n` +
+        `If we proceed, inserted rows would NOT be logged into sym_change_log\n` +
+        `and would NOT propagate to hub or other branches.\n\n` +
+        `Problems:\n  ${problems.join("\n  ")}\n\n` +
+        `Fix: run "node triggers.js" on this target to install triggers,\n` +
+        `or set SETUP_TRIGGERS_ON_STARTUP=true and restart the engine once.`,
+    );
+  }
+
+  // Also verify sym_change_log and sym_checkpoint tables exist
+  const [syncTables] = await targetDb.execute(
+    `SELECT TABLE_NAME FROM information_schema.TABLES
+     WHERE TABLE_SCHEMA = DATABASE()
+       AND TABLE_NAME IN ('sym_change_log', 'sym_checkpoint')`,
+  );
+  const presentTables = new Set(syncTables.map((r) => r.TABLE_NAME));
+  if (!presentTables.has("sym_change_log")) {
+    throw new Error(
+      "[Preflight FAILED] sym_change_log table does not exist on target. " +
+        "Run the replica engine once to provision the target.",
+    );
+  }
+
+  console.log(
+    "[Preflight] sym_change_log and sym_checkpoint tables present ✅",
+  );
+}
+
+/**
+ * Verify that @sym_is_syncing is not set on this session.
+ * If it's set to TRUE (e.g., leaked from a previous operation), triggers
+ * will be suppressed and inserts won't be logged.
+ */
+async function verifySessionIsClean(targetDb) {
+  const [rows] = await targetDb.execute("SELECT @sym_is_syncing AS val");
+  const val = rows[0]?.val;
+  if (val !== null && val !== 0) {
+    console.warn(
+      `[Preflight] @sym_is_syncing is set to ${JSON.stringify(val)}. ` +
+        `Clearing it so triggers fire.`,
+    );
+    await targetDb.execute("SET @sym_is_syncing = NULL");
+  }
+  console.log("[Preflight] Session @sym_is_syncing is clean ✅");
+}
+
+/**
+ * After the migration commits, verify that sym_change_log actually
+ * received INSERT events for the migrated tables. If any table has 0
+ * events, the triggers didn't fire and the data will not propagate.
+ */
+async function verifySyncLogPopulated(targetDb, startTime) {
+  console.log("");
+  console.log("[Postflight] Checking sym_change_log for new INSERT events...");
+
+  let allPopulated = true;
+  for (const table of SYNC_TABLES) {
+    const [rows] = await targetDb.execute(
+      `SELECT COUNT(*) AS c FROM sym_change_log
+       WHERE table_name = ?
+         AND operation = 'INSERT'
+         AND created_at >= ?`,
+      [table, startTime],
+    );
+    const count = Number(rows[0]?.c || 0);
+    if (count === 0) {
+      console.error(
+        `  ⚠️  ${table}: 0 INSERT events in log since migration started!`,
+      );
+      console.error(
+        `      → Triggers did NOT fire. Data will NOT sync to other nodes.`,
+      );
+      allPopulated = false;
+    } else {
+      console.log(`  ✅ ${table}: ${count} INSERT event(s) in log`);
+    }
+  }
+
+  if (!allPopulated) {
+    throw new Error(
+      "\n[Postflight FAILED] Some tables have no INSERT events in sym_change_log.\n" +
+        "The data was inserted into the target tables but NOT logged.\n" +
+        "Consequence: the sync engine cannot propagate these rows to hub or other branches.\n\n" +
+        "Likely causes:\n" +
+        "  - Triggers were dropped between preflight and now (unlikely)\n" +
+        "  - @sym_is_syncing was set during the inserts (should not happen now)\n" +
+        "  - Trigger definition is wrong (check SHOW CREATE TRIGGER)\n\n" +
+        "Fix: run 'node triggers.js' on this target, then manually re-run the migration.",
+    );
+  }
+
+  console.log("[Postflight] All tables have INSERT events in log ✅");
+}
+
+/**
+ * Wait for the sync engine to propagate, then run node-copy --verify
+ * to confirm all nodes are in parity.
+ *
+ * Optional — only runs if VERIFY_AFTER_MIGRATION=true is set in .env.
+ */
+async function waitAndVerifyParity() {
+  if (process.env.VERIFY_AFTER_MIGRATION !== "true") {
+    console.log("");
+    console.log(
+      "[Postflight] Skipping parity check (set VERIFY_AFTER_MIGRATION=true to enable)",
+    );
+    return;
+  }
+
+  const waitMs = Number(process.env.VERIFY_WAIT_MS) || 15000;
+  console.log("");
+  console.log(
+    `[Postflight] Waiting ${waitMs / 1000}s for sync engine to propagate...`,
+  );
+  await new Promise((r) => setTimeout(r, waitMs));
+
+  console.log("[Postflight] Running node-copy.js --verify...");
+  try {
+    const output = execSync(
+      `node node-copy.js --verify --tables=${SYNC_TABLES.join(",")}`,
+      { cwd: __dirname, encoding: "utf8", stdio: "pipe" },
+    );
+    const warns = output.split("\n").filter((l) => l.includes("[WARN]"));
+    if (warns.length > 0) {
+      console.error("[Postflight] ⚠️  Drift detected after migration:");
+      warns.forEach((w) => console.error("  " + w));
+      console.error(
+        "[Postflight] The engine may still be processing. " +
+          "Wait another 30s and run 'node node-copy.js --verify --tables=" +
+          SYNC_TABLES.join(",") +
+          "' manually.",
+      );
+    } else {
+      console.log("[Postflight] ✅ All nodes in parity after migration");
+    }
+  } catch (err) {
+    console.error(
+      `[Postflight] Parity check failed: ${err.message}. ` +
+        `Run 'node node-copy.js --verify --tables=${SYNC_TABLES.join(",")}' manually.`,
+    );
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* Main migration                                                     */
+/* ------------------------------------------------------------------ */
 
 async function runMigration() {
   const isDryRun = process.argv.includes("--dry-run");
@@ -62,6 +258,13 @@ async function runMigration() {
       `[Migration] Target DB: ${process.env.DB_TARGET_HOST}:${targetPort}/${process.env.DB_TARGET_DATABASE}`,
     );
 
+    // ─── NEW: pre-flight trigger & session checks ───
+    await verifyTargetTriggers(targetDb);
+    await verifySessionIsClean(targetDb);
+
+    // Record when the migration starts so postflight can filter log entries
+    const migrationStartTime = new Date();
+
     // Start database transaction on target DB
     await targetDb.beginTransaction();
 
@@ -76,15 +279,11 @@ async function runMigration() {
       return chunks;
     }
 
-    // Normalize lookup keys so trailing spaces / casing drift don't break matches.
     function normalizeName(name) {
       if (name == null) return null;
       return String(name).trim().toLowerCase();
     }
 
-    // Legacy lookup name -> target lookup name, for cases where the concept is
-    // the same but the target uses a different word/spacing/plural.
-    // Keys are normalized (trim + lowercase) to match normalizeName().
     const lookupAliases = {
       product_type: {
         "pots / pans": "pot & pans",
@@ -103,9 +302,6 @@ async function runMigration() {
       unit_of_measure: {},
     };
 
-    // Every lookup table in this schema has a status column (see SHOW COLUMNS).
-    // We only want to link freshly migrated products to ACTIVE rows, otherwise
-    // ORDER BY record_id may pick an inactive duplicate as the winner.
     async function loadNameMap(tableName) {
       const [rows] = await targetDb.execute(
         `SELECT record_id, name FROM ${tableName} WHERE status = 1 ORDER BY record_id`,
@@ -259,7 +455,7 @@ async function runMigration() {
     );
 
     // ----------------------------------------------------
-    // STEP 2: SYNC PRICING SCHEMES FOR THESE ACTIVE PRODUCTS
+    // STEP 2: SYNC PRICING SCHEMES
     // ----------------------------------------------------
     const [legacyPricing] = await legacyDb.execute(
       `
@@ -357,7 +553,7 @@ async function runMigration() {
     );
 
     // ----------------------------------------------------
-    // STEP 3: SYNC STOCKS ON HAND FOR THESE ACTIVE PRODUCTS
+    // STEP 3: SYNC STOCKS ON HAND
     // ----------------------------------------------------
     const [legacyStocks] = await legacyDb.execute(
       `
@@ -428,6 +624,9 @@ async function runMigration() {
       `[Migration] Stocks sync completed successfully. (${stocksSynced} records upserted in batches)`,
     );
 
+    // ----------------------------------------------------
+    // COMMIT or ROLLBACK
+    // ----------------------------------------------------
     if (isDryRun) {
       console.log("--------------------------------------------------");
       console.log("🔄 Rolling back transaction (--dry-run detected)...");
@@ -436,14 +635,19 @@ async function runMigration() {
         "✨ DRY RUN FINISHED: All changes successfully rolled back. Database is clean.",
       );
       console.log("--------------------------------------------------");
-    } else {
-      console.log("💾 Committing transaction to database...");
-      await targetDb.commit();
-      console.log("✨ LIVE MIGRATION COMMITTED SUCCESSFULLY.");
+      return; // skip postflight for dry-run
     }
+
+    console.log("💾 Committing transaction to database...");
+    await targetDb.commit();
+    console.log("✨ LIVE MIGRATION COMMITTED SUCCESSFULLY.");
+
+    // ─── NEW: postflight — verify log populated, then optional parity ───
+    await verifySyncLogPopulated(targetDb, migrationStartTime);
+    await waitAndVerifyParity();
   } catch (error) {
     console.error("\n[Error] Migration failed. Details below:");
-    console.error(error); // Prints full stack trace and MySQL error details
+    console.error(error);
     try {
       await targetDb.rollback();
       console.error("[Migration] Transaction successfully rolled back.");
