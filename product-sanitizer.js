@@ -1,6 +1,5 @@
 require("dotenv").config();
 const mysql = require("mysql2/promise");
-const crypto = require("crypto");
 
 /* ================================================================== */
 /* CLI flags                                                          */
@@ -9,10 +8,10 @@ const ARGV = process.argv.slice(2);
 const APPLY = ARGV.includes("--apply");
 const SETUP = ARGV.includes("--setup");
 const CHECK_ONLY = ARGV.includes("--check");
-const TARGET_DB = ARGV.includes("--target"); // run against DB_TARGET_*
 const INCLUDE_UNSAFE = ARGV.includes("--include-unsafe");
 const SKIP_CLUSTER = ARGV.includes("--skip-cluster-check");
-const ONLY = getFlagValue("--only"); // single normalized code
+const FORCE_ANY_DB = ARGV.includes("--force-any-db");
+const ONLY = getFlagValue("--only");
 
 function getFlagValue(name) {
   const i = ARGV.indexOf(name);
@@ -20,7 +19,7 @@ function getFlagValue(name) {
 }
 
 /* ================================================================== */
-/* Sanitization — same logic as runner.js                             */
+/* Sanitization — matches runner.js exactly                           */
 /* ================================================================== */
 function sanitizeProductCode(raw) {
   if (raw == null) return null;
@@ -55,20 +54,29 @@ function looksLikeUuid(id) {
 }
 
 /* ================================================================== */
-/* Connection (source or target DB)                                   */
+/* Target-only connection (DB_TARGET_*)                               */
 /* ================================================================== */
-function buildPool() {
-  const prefix = TARGET_DB ? "DB_TARGET_" : "DB_";
-  const host = process.env[prefix + "HOST"];
-  const port = Number(process.env[prefix + "PORT"]) || 3306;
-  const user = process.env[prefix + "USERNAME"];
-  const pass = process.env[prefix + "PASSWORD"] || "";
-  const db = process.env[prefix + "DATABASE"];
+const EXPECTED_DB = "candg_pos_db_main";
+
+function buildTargetPool() {
+  const host = process.env.DB_TARGET_HOST;
+  const port = Number(process.env.DB_TARGET_PORT) || 3306;
+  const user = process.env.DB_TARGET_USERNAME;
+  const pass = process.env.DB_TARGET_PASSWORD || "";
+  const db = process.env.DB_TARGET_DATABASE;
 
   if (!host || !user || !db) {
     console.error(
-      `[Error] Missing ${prefix}HOST / ${prefix}USERNAME / ${prefix}DATABASE in .env`,
+      "[Error] Missing DB_TARGET_HOST / DB_TARGET_USERNAME / DB_TARGET_DATABASE in .env",
     );
+    process.exit(1);
+  }
+
+  if (db !== EXPECTED_DB && !FORCE_ANY_DB) {
+    console.error(
+      `[Safety] Refusing to run: DB_TARGET_DATABASE is "${db}", expected "${EXPECTED_DB}".`,
+    );
+    console.error(`         If this is intentional, pass --force-any-db.`);
     process.exit(1);
   }
 
@@ -85,10 +93,10 @@ function buildPool() {
   });
 }
 
-const pool = buildPool();
+const pool = buildTargetPool();
 
 /* ================================================================== */
-/* Child tables (from information_schema — product.record_id refs)    */
+/* Child tables (product.record_id FKs)                               */
 /* ================================================================== */
 const CHILD_TABLES = [
   { table: "damaged_stocks_on_hand", column: "product" },
@@ -105,14 +113,14 @@ const CHILD_TABLES = [
   { table: "store_expenses_item", column: "product" },
 ];
 
-/* Tables with UNIQUE keys that need pre-dedupe before repointing */
+/* Tables with UNIQUE keys on product-related columns */
 const UNIQUE_ON_PRODUCT = {
   stocks_on_hand: ["store"],
   pricing_scheme: ["store", "price", "uom", "is_default"],
 };
 
 /* ================================================================== */
-/* Cluster preflight (mirrors runner.js / audit.js)                   */
+/* Cluster preflight                                                  */
 /* ================================================================== */
 async function checkCluster(conn) {
   const [rows] = await conn.query(
@@ -162,8 +170,8 @@ async function preflight({ requireCluster }) {
     const cluster = await checkCluster(conn);
     if (!cluster.isCluster) {
       const msg =
-        `DB "${process.env[TARGET_DB ? "DB_TARGET_DATABASE" : "DB_DATABASE"]}" ` +
-        `is NOT a cluster node (sym_change_log ${cluster.hasLog ? "present" : "MISSING"}, ` +
+        `Target DB "${process.env.DB_TARGET_DATABASE}" is NOT a cluster node ` +
+        `(sym_change_log ${cluster.hasLog ? "present" : "MISSING"}, ` +
         `sym_checkpoint ${cluster.hasCp ? "present" : "MISSING"}).`;
       if (requireCluster) {
         console.error("❌ " + msg);
@@ -175,14 +183,14 @@ async function preflight({ requireCluster }) {
       return { ok: true, cluster: false };
     }
 
-    console.log("✅ Cluster node confirmed");
+    console.log("✅ Target cluster node confirmed");
 
     const tablesToCheck = ["product", "pricing_scheme", "stocks_on_hand"];
     const trig = await checkTriggers(conn, tablesToCheck);
     if (trig.problems.length) {
       console.error("❌ Missing sync triggers:");
       for (const p of trig.problems) console.error("   " + p);
-      console.error('   Run "node triggers.js" on this DB first.');
+      console.error('   Run "node triggers.js" on this target first.');
       process.exitCode = 1;
       return { ok: false, reason: "missing triggers" };
     }
@@ -205,10 +213,12 @@ async function preflight({ requireCluster }) {
 }
 
 /* ================================================================== */
-/* Audit table (self-contained)                                       */
+/* Audit table                                                        */
 /* ================================================================== */
 async function setupAudit() {
-  console.log("🔧 Creating product_merge_log...");
+  console.log(
+    `🔧 Creating product_merge_log on ${process.env.DB_TARGET_DATABASE}...`,
+  );
   await pool.query(`
     CREATE TABLE IF NOT EXISTS product_merge_log (
       id             BIGINT AUTO_INCREMENT PRIMARY KEY,
@@ -236,7 +246,7 @@ async function auditLog(conn, survivorId, loserId, normalizedKey, snapshot) {
 }
 
 /* ================================================================== */
-/* Detection — scan all products, group by clean code                 */
+/* Scan                                                               */
 /* ================================================================== */
 async function scan() {
   const [rows] = await pool.query(`
@@ -253,7 +263,6 @@ async function scan() {
     const clean = sanitizeProductCode(r.product_code);
     if (!clean) continue;
     if (isCorruptCode(r.product_code)) corruptCount++;
-
     if (!byClean.has(clean)) byClean.set(clean, []);
     byClean.get(clean).push(r);
   }
@@ -261,13 +270,11 @@ async function scan() {
   const groups = [];
   for (const [clean, list] of byClean) {
     const hasCorrupt = list.some((r) => isCorruptCode(r.product_code));
-    if (!hasCorrupt) continue; // no action needed for already-clean groups
-
+    if (!hasCorrupt) continue;
     const particulars = new Set(
       list.map((r) => normalizeParticular(r.particular)),
     );
     const safe = particulars.size === 1;
-
     groups.push({
       normalizedCode: clean,
       hasCorrupt,
@@ -276,7 +283,6 @@ async function scan() {
       rows: list,
     });
   }
-
   groups.sort(
     (a, b) =>
       b.rows.length - a.rows.length ||
@@ -285,9 +291,6 @@ async function scan() {
   return { groups, totalRows: rows.length, corruptCount };
 }
 
-/* ================================================================== */
-/* Survivor pick: prefer valid UUID; among those, oldest date_added   */
-/* ================================================================== */
 function pickSurvivor(rows) {
   const uuids = rows.filter((r) => looksLikeUuid(r.record_id));
   const candidates = uuids.length ? uuids : rows;
@@ -300,7 +303,7 @@ function pickSurvivor(rows) {
 }
 
 /* ================================================================== */
-/* Unique-key-aware repoint for a single child table                  */
+/* Repoint a single child table                                       */
 /* ================================================================== */
 async function repointTable(
   conn,
@@ -320,21 +323,21 @@ async function repointTable(
     return r.affectedRows;
   }
 
-  // Unique-key table: fetch loser rows, check for collisions with survivor
-  const cols = ["record_id", ...uniqueOn].join(", ");
-  const [loserRows] = await conn
-    .query(
-      `SELECT ${cols}, qty FROM \`${table}\` WHERE \`${column}\` IN (${ph})`,
+  const cols = ["record_id", ...uniqueOn];
+  let loserRows;
+  try {
+    const [rows] = await conn.query(
+      `SELECT ${cols.join(", ")}, qty FROM \`${table}\` WHERE \`${column}\` IN (${ph})`,
       loserIds,
-    )
-    .catch(async () => {
-      // some tables (e.g. pricing_scheme) may not have qty column
-      const [rows] = await conn.query(
-        `SELECT ${cols} FROM \`${table}\` WHERE \`${column}\` IN (${ph})`,
-        loserIds,
-      );
-      return [rows];
-    });
+    );
+    loserRows = rows;
+  } catch {
+    const [rows] = await conn.query(
+      `SELECT ${cols.join(", ")} FROM \`${table}\` WHERE \`${column}\` IN (${ph})`,
+      loserIds,
+    );
+    loserRows = rows;
+  }
 
   let repointed = 0;
   for (const row of loserRows) {
@@ -347,8 +350,6 @@ async function repointTable(
     );
 
     if (ex.length) {
-      // Collision: survivor already has a row for this unique key.
-      // For stocks_on_hand we SUM qty; for pricing_scheme we keep survivor.
       if (table === "stocks_on_hand" && "qty" in row) {
         await conn.query(
           `UPDATE stocks_on_hand SET qty = qty + ?, updated_at = NOW()
@@ -377,11 +378,8 @@ async function mergeGroup(group, { dryRun }) {
   const survivor = pickSurvivor(group.rows);
   const losers = group.rows.filter((r) => r.record_id !== survivor.record_id);
 
-  if (losers.length === 0) {
-    return { ok: false, error: "no losers to merge" };
-  }
+  if (losers.length === 0) return { ok: false, error: "no losers to merge" };
 
-  // Validate normalized codes + particulars match
   const sCode = sanitizeProductCode(survivor.product_code);
   const sPart = normalizeParticular(survivor.particular);
   for (const l of losers) {
@@ -405,7 +403,6 @@ async function mergeGroup(group, { dryRun }) {
   try {
     await conn.beginTransaction();
 
-    // Lock survivor + losers
     const [surv] = await conn.query(
       "SELECT * FROM product WHERE record_id = ? FOR UPDATE",
       [survivor.record_id],
@@ -423,14 +420,12 @@ async function mergeGroup(group, { dryRun }) {
       );
     }
 
-    // Audit snapshot
     if (!dryRun) {
       for (const l of locked) {
         await auditLog(conn, survivor.record_id, l.record_id, sCode, l);
       }
     }
 
-    // Repoint children
     const repointed = {};
     for (const { table, column } of CHILD_TABLES) {
       const n = await repointTable(
@@ -444,7 +439,6 @@ async function mergeGroup(group, { dryRun }) {
       if (n > 0) repointed[table] = n;
     }
 
-    // Canonicalize survivor's code
     if (survivor.product_code !== sCode) {
       await conn.query(
         "UPDATE product SET product_code = ?, updated_at = NOW() WHERE record_id = ?",
@@ -452,7 +446,6 @@ async function mergeGroup(group, { dryRun }) {
       );
     }
 
-    // Delete losers
     await conn.query(
       `DELETE FROM product WHERE record_id IN (${ph})`,
       loserIds,
@@ -468,7 +461,6 @@ async function mergeGroup(group, { dryRun }) {
         repointed,
       };
     }
-
     await conn.commit();
     return {
       ok: true,
@@ -486,9 +478,9 @@ async function mergeGroup(group, { dryRun }) {
 }
 
 /* ================================================================== */
-/* Rename a corrupt orphan (no clean twin exists)                     */
+/* Rename a corrupt orphan (no clean twin)                            */
 /* ================================================================== */
-async function renameOrphan(row) {
+async function renameOrphan(row, { dryRun }) {
   const clean = sanitizeProductCode(row.product_code);
   if (!clean) throw new Error(`empty clean code for ${row.record_id}`);
   if (clean === row.product_code) return { ok: false, error: "already clean" };
@@ -506,15 +498,12 @@ async function renameOrphan(row) {
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
-
     await conn.query(
       "SELECT record_id FROM product WHERE record_id = ? FOR UPDATE",
       [row.record_id],
     );
 
-    if (!APPLY) {
-      // dry-run path below
-    } else {
+    if (!dryRun) {
       await auditLog(conn, row.record_id, row.record_id, clean, {
         type: "rename",
         from: row.product_code,
@@ -526,7 +515,7 @@ async function renameOrphan(row) {
       );
     }
 
-    if (!APPLY) {
+    if (dryRun) {
       await conn.rollback();
       return {
         ok: true,
@@ -556,11 +545,8 @@ async function renameOrphan(row) {
 /* Main                                                               */
 /* ================================================================== */
 async function main() {
-  const dbLabel = TARGET_DB
-    ? `${process.env.DB_TARGET_HOST}:${process.env.DB_TARGET_PORT}/${process.env.DB_TARGET_DATABASE}`
-    : `${process.env.DB_HOST}:${process.env.DB_PORT}/${process.env.DB_DATABASE}`;
-
-  console.log(`DB (${TARGET_DB ? "target" : "source"}): ${dbLabel}`);
+  const dbLabel = `${process.env.DB_TARGET_HOST}:${process.env.DB_TARGET_PORT}/${process.env.DB_TARGET_DATABASE}`;
+  console.log(`Target DB: ${dbLabel}`);
   console.log(
     APPLY
       ? "⚠️  APPLY MODE — database WILL be modified"
@@ -585,8 +571,9 @@ async function main() {
   }
 
   const { groups, totalRows, corruptCount } = await scan();
-
-  console.log(`\n📊 Scanned ${totalRows} product row(s).`);
+  console.log(
+    `\n📊 Scanned ${totalRows} product row(s) in ${process.env.DB_TARGET_DATABASE}.`,
+  );
   console.log(`   Corrupt codes (MUG/CR/literal-\\r): ${corruptCount}`);
   console.log(`   Groups needing action: ${groups.length}`);
 
@@ -595,9 +582,9 @@ async function main() {
     return;
   }
 
-  let renamed = 0;
-  let merged = 0;
-  let skipped = 0;
+  let renamed = 0,
+    merged = 0,
+    skipped = 0;
 
   for (const g of groups) {
     if (ONLY && g.normalizedCode !== ONLY.toUpperCase()) continue;
@@ -611,14 +598,17 @@ async function main() {
     }
 
     if (g.rows.length === 1) {
-      const row = g.rows[0];
       try {
-        const res = await renameOrphan(row);
-        console.log(
-          `   ✏️  ${res.dryRun ? "WOULD RENAME" : "RENAMED"}: ${JSON.stringify(res.from)} → ${JSON.stringify(res.to)}`,
-        );
-        if (!res.ok && res.error) console.log(`   ⏭️  ${res.error}`);
-        else renamed++;
+        const res = await renameOrphan(g.rows[0], { dryRun: !APPLY });
+        if (res.ok) {
+          console.log(
+            `   ✏️  ${res.dryRun ? "WOULD RENAME" : "RENAMED"}: ${JSON.stringify(res.from)} → ${JSON.stringify(res.to)}`,
+          );
+          renamed++;
+        } else {
+          console.log(`   ⏭️  ${res.error}`);
+          skipped++;
+        }
       } catch (e) {
         console.log(`   ❌ FAILED to rename: ${e.message}`);
         skipped++;
@@ -655,10 +645,7 @@ async function main() {
     `\nDone. ${APPLY ? "renamed" : "would-rename"}=${renamed}  ` +
       `${APPLY ? "merged" : "would-merge"}=${merged}  skipped=${skipped}`,
   );
-
-  if (!APPLY) {
-    console.log("\nRun again with --apply to execute.");
-  }
+  if (!APPLY) console.log("\nRun again with --apply to execute.");
 }
 
 main()
