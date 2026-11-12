@@ -1,4 +1,4 @@
-require("dotenv").config();
+require("dotenv").config({ override: true });
 const mysql = require("mysql2/promise");
 
 /* ================================================================== */
@@ -8,9 +8,9 @@ const ARGV = process.argv.slice(2);
 const APPLY = ARGV.includes("--apply");
 const SETUP = ARGV.includes("--setup");
 const CHECK_ONLY = ARGV.includes("--check");
+const VERIFY_ONLY = ARGV.includes("--verify-only");
 const INCLUDE_UNSAFE = ARGV.includes("--include-unsafe");
 const SKIP_CLUSTER = ARGV.includes("--skip-cluster-check");
-const FORCE_ANY_DB = ARGV.includes("--force-any-db");
 const ONLY = getFlagValue("--only");
 
 function getFlagValue(name) {
@@ -54,49 +54,40 @@ function looksLikeUuid(id) {
 }
 
 /* ================================================================== */
-/* Target-only connection (DB_TARGET_*)                               */
+/* Connection — uses exactly what .env says, no defaults, no checks   */
 /* ================================================================== */
-const EXPECTED_DB = "candg_pos_db_main";
+const HOST = process.env.DB_TARGET_HOST;
+const PORT = Number(process.env.DB_TARGET_PORT) || 3306;
+const USER = process.env.DB_TARGET_USERNAME;
+const PASS = process.env.DB_TARGET_PASSWORD || "";
+const DB = process.env.DB_TARGET_DATABASE;
 
-function buildTargetPool() {
-  const host = process.env.DB_TARGET_HOST;
-  const port = Number(process.env.DB_TARGET_PORT) || 3306;
-  const user = process.env.DB_TARGET_USERNAME;
-  const pass = process.env.DB_TARGET_PASSWORD || "";
-  const db = process.env.DB_TARGET_DATABASE;
-
-  if (!host || !user || !db) {
-    console.error(
-      "[Error] Missing DB_TARGET_HOST / DB_TARGET_USERNAME / DB_TARGET_DATABASE in .env",
-    );
-    process.exit(1);
-  }
-
-  if (db !== EXPECTED_DB && !FORCE_ANY_DB) {
-    console.error(
-      `[Safety] Refusing to run: DB_TARGET_DATABASE is "${db}", expected "${EXPECTED_DB}".`,
-    );
-    console.error(`         If this is intentional, pass --force-any-db.`);
-    process.exit(1);
-  }
-
-  return mysql.createPool({
-    host,
-    port,
-    user,
-    password: pass,
-    database: db,
-    waitForConnections: true,
-    connectionLimit: 5,
-    timezone: "Z",
-    dateStrings: true,
-  });
+if (!HOST || !USER || !DB) {
+  console.error(
+    "[Error] Missing DB_TARGET_HOST / DB_TARGET_USERNAME / DB_TARGET_DATABASE in .env",
+  );
+  process.exit(1);
 }
 
-const pool = buildTargetPool();
+console.log(`[Init] DB_TARGET_HOST     = ${HOST}:${PORT}`);
+console.log(`[Init] DB_TARGET_USERNAME = ${USER}`);
+console.log(`[Init] DB_TARGET_DATABASE = ${DB}`);
+console.log("");
+
+const pool = mysql.createPool({
+  host: HOST,
+  port: PORT,
+  user: USER,
+  password: PASS,
+  database: DB,
+  waitForConnections: true,
+  connectionLimit: 5,
+  timezone: "Z",
+  dateStrings: true,
+});
 
 /* ================================================================== */
-/* Child tables (product.record_id FKs)                               */
+/* Child tables that reference product.record_id                      */
 /* ================================================================== */
 const CHILD_TABLES = [
   { table: "damaged_stocks_on_hand", column: "product" },
@@ -113,7 +104,6 @@ const CHILD_TABLES = [
   { table: "store_expenses_item", column: "product" },
 ];
 
-/* Tables with UNIQUE keys on product-related columns */
 const UNIQUE_ON_PRODUCT = {
   stocks_on_hand: ["store"],
   pricing_scheme: ["store", "price", "uom", "is_default"],
@@ -170,7 +160,7 @@ async function preflight({ requireCluster }) {
     const cluster = await checkCluster(conn);
     if (!cluster.isCluster) {
       const msg =
-        `Target DB "${process.env.DB_TARGET_DATABASE}" is NOT a cluster node ` +
+        `DB "${DB}" is NOT a cluster node ` +
         `(sym_change_log ${cluster.hasLog ? "present" : "MISSING"}, ` +
         `sym_checkpoint ${cluster.hasCp ? "present" : "MISSING"}).`;
       if (requireCluster) {
@@ -183,14 +173,14 @@ async function preflight({ requireCluster }) {
       return { ok: true, cluster: false };
     }
 
-    console.log("✅ Target cluster node confirmed");
+    console.log(`✅ Cluster node confirmed on "${DB}"`);
 
     const tablesToCheck = ["product", "pricing_scheme", "stocks_on_hand"];
     const trig = await checkTriggers(conn, tablesToCheck);
     if (trig.problems.length) {
       console.error("❌ Missing sync triggers:");
       for (const p of trig.problems) console.error("   " + p);
-      console.error('   Run "node triggers.js" on this target first.');
+      console.error('   Run "node triggers.js" on this DB first.');
       process.exitCode = 1;
       return { ok: false, reason: "missing triggers" };
     }
@@ -216,9 +206,7 @@ async function preflight({ requireCluster }) {
 /* Audit table                                                        */
 /* ================================================================== */
 async function setupAudit() {
-  console.log(
-    `🔧 Creating product_merge_log on ${process.env.DB_TARGET_DATABASE}...`,
-  );
+  console.log(`🔧 Creating product_merge_log on ${DB}...`);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS product_merge_log (
       id             BIGINT AUTO_INCREMENT PRIMARY KEY,
@@ -542,11 +530,75 @@ async function renameOrphan(row, { dryRun }) {
 }
 
 /* ================================================================== */
+/* Orphan verification (--verify-only)                                */
+/* ================================================================== */
+async function verifyOrphans() {
+  console.log("\n🔎 Verifying FK integrity across all child tables...\n");
+
+  const problems = [];
+
+  for (const { table, column } of CHILD_TABLES) {
+    const [rows] = await pool.query(
+      `SELECT COUNT(*) AS n
+         FROM \`${table}\` c
+         LEFT JOIN product p ON p.record_id = c.\`${column}\`
+        WHERE c.\`${column}\` IS NOT NULL
+          AND p.record_id IS NULL`,
+    );
+    const orphanCount = Number(rows[0].n);
+
+    if (orphanCount === 0) {
+      console.log(`   ✅ ${table.padEnd(35)} 0 orphans`);
+      continue;
+    }
+
+    const [sample] = await pool.query(
+      `SELECT c.\`${column}\` AS product_id, COUNT(*) AS rows_per_product
+         FROM \`${table}\` c
+         LEFT JOIN product p ON p.record_id = c.\`${column}\`
+        WHERE c.\`${column}\` IS NOT NULL
+          AND p.record_id IS NULL
+        GROUP BY c.\`${column}\`
+        LIMIT 10`,
+    );
+
+    console.log(`   ❌ ${table.padEnd(35)} ${orphanCount} orphan row(s)`);
+    for (const s of sample) {
+      console.log(`        ${s.product_id}  (${s.rows_per_product} row(s))`);
+    }
+
+    problems.push({ table, column, count: orphanCount, sample });
+  }
+
+  console.log("");
+  if (problems.length === 0) {
+    console.log(
+      `✅ All ${CHILD_TABLES.length} child tables have zero orphan rows on ${DB}.\n`,
+    );
+    return 0;
+  }
+
+  const totalOrphans = problems.reduce((a, b) => a + b.count, 0);
+  console.log(
+    `❌ ${problems.length} child table(s) have orphans — total ${totalOrphans} row(s).\n`,
+  );
+  return problems.length;
+}
+
+async function verifySessionStillClean() {
+  const conn = await pool.getConnection();
+  try {
+    const [rows] = await conn.query("SELECT @sym_is_syncing AS v");
+    return rows[0]?.v == null || rows[0].v === 0;
+  } finally {
+    conn.release();
+  }
+}
+
+/* ================================================================== */
 /* Main                                                               */
 /* ================================================================== */
 async function main() {
-  const dbLabel = `${process.env.DB_TARGET_HOST}:${process.env.DB_TARGET_PORT}/${process.env.DB_TARGET_DATABASE}`;
-  console.log(`Target DB: ${dbLabel}`);
   console.log(
     APPLY
       ? "⚠️  APPLY MODE — database WILL be modified"
@@ -570,10 +622,22 @@ async function main() {
     return;
   }
 
+  if (VERIFY_ONLY) {
+    const orphanCount = await verifyOrphans();
+    const clean = await verifySessionStillClean();
+    if (!clean) {
+      console.error(
+        "❌ @sym_is_syncing is set after verification — investigate.",
+      );
+      process.exitCode = 2;
+      return;
+    }
+    process.exitCode = orphanCount === 0 ? 0 : 1;
+    return;
+  }
+
   const { groups, totalRows, corruptCount } = await scan();
-  console.log(
-    `\n📊 Scanned ${totalRows} product row(s) in ${process.env.DB_TARGET_DATABASE}.`,
-  );
+  console.log(`\n📊 Scanned ${totalRows} product row(s) in ${DB}.`);
   console.log(`   Corrupt codes (MUG/CR/literal-\\r): ${corruptCount}`);
   console.log(`   Groups needing action: ${groups.length}`);
 
@@ -645,7 +709,26 @@ async function main() {
     `\nDone. ${APPLY ? "renamed" : "would-rename"}=${renamed}  ` +
       `${APPLY ? "merged" : "would-merge"}=${merged}  skipped=${skipped}`,
   );
-  if (!APPLY) console.log("\nRun again with --apply to execute.");
+  if (!APPLY) {
+    console.log("\nRun again with --apply to execute.");
+    return;
+  }
+
+  const orphanCount = await verifyOrphans();
+  if (orphanCount > 0) {
+    console.error(
+      "\n⚠️  Merge committed, but orphaned child rows were detected afterwards.",
+    );
+    console.error(
+      "   This means a child table NOT in CHILD_TABLES referenced the losers,",
+    );
+    console.error(
+      "   OR the transaction partially succeeded (shouldn't happen).",
+    );
+    process.exitCode = 1;
+  } else {
+    console.log("✅ Post-merge verification passed — no orphaned children.");
+  }
 }
 
 main()
