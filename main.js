@@ -6,18 +6,52 @@ const { execSync } = require("child_process");
 const BATCH_SIZE = 500;
 
 /* ------------------------------------------------------------------ */
+/* PRODUCT CODE SANITIZATION — single source of truth                  */
+/* ------------------------------------------------------------------ */
+/**
+ * Strip known legacy corruptions from a product_code:
+ *   - real CR (0x0D)          e.g. "MUG\x0DBILD6157124"
+ *   - real LF (0x0A)
+ *   - real TAB (0x09)
+ *   - literal backslash-r     e.g. "MUG\rBILD6157124"  (bytes 5C 72)
+ *   - literal backslash-n
+ *   - leading "MUG" prefix
+ *   - surrounding whitespace
+ *
+ * Does NOT touch legitimate internal spaces (e.g. "ARM BAND3946115",
+ * "T-SHONE 6357124", "GAS LPG2571121"). Only leading/junk is stripped.
+ */
+function sanitizeProductCode(raw) {
+  if (raw == null) return null;
+  let s = String(raw);
+  s = s.replace(/\r/g, ""); // real CR
+  s = s.replace(/\n/g, ""); // real LF
+  s = s.replace(/\t/g, ""); // real TAB
+  s = s.replace(/\\r/g, ""); // literal backslash-r
+  s = s.replace(/\\n/g, ""); // literal backslash-n
+  s = s.replace(/^MUG\s*/i, ""); // leading MUG prefix
+  s = s.trim().toUpperCase();
+  return s;
+}
+
+function sanitizeProductRow(item) {
+  const clean = sanitizeProductCode(item.product_code);
+  if (!clean) {
+    throw new Error(
+      `[Sanitizer] Product has empty product_code after sanitization. ` +
+        `Raw=${JSON.stringify(item.product_code)} ` +
+        `particular=${JSON.stringify(item.particular)}`,
+    );
+  }
+  return { ...item, product_code: clean };
+}
+
+/* ------------------------------------------------------------------ */
 /* Pre-flight / post-flight helpers                                   */
 /* ------------------------------------------------------------------ */
 
 const SYNC_TABLES = ["product", "pricing_scheme", "stocks_on_hand"];
 
-/**
- * Verify that every sync table on the target has all 3 triggers
- * (INSERT, UPDATE, DELETE). If any are missing, inserts from this
- * migration will NOT be logged and will NOT propagate to other nodes.
- *
- * Throws if the target is not safe to write to.
- */
 async function verifyTargetTriggers(targetDb) {
   console.log("[Preflight] Checking sync triggers on target...");
   const problems = [];
@@ -62,7 +96,6 @@ async function verifyTargetTriggers(targetDb) {
     );
   }
 
-  // Also verify sym_change_log and sym_checkpoint tables exist
   const [syncTables] = await targetDb.execute(
     `SELECT TABLE_NAME FROM information_schema.TABLES
      WHERE TABLE_SCHEMA = DATABASE()
@@ -81,11 +114,6 @@ async function verifyTargetTriggers(targetDb) {
   );
 }
 
-/**
- * Verify that @sym_is_syncing is not set on this session.
- * If it's set to TRUE (e.g., leaked from a previous operation), triggers
- * will be suppressed and inserts won't be logged.
- */
 async function verifySessionIsClean(targetDb) {
   const [rows] = await targetDb.execute("SELECT @sym_is_syncing AS val");
   const val = rows[0]?.val;
@@ -99,11 +127,6 @@ async function verifySessionIsClean(targetDb) {
   console.log("[Preflight] Session @sym_is_syncing is clean ✅");
 }
 
-/**
- * After the migration commits, verify that sym_change_log actually
- * received INSERT events for the migrated tables. If any table has 0
- * events, the triggers didn't fire and the data will not propagate.
- */
 async function verifySyncLogPopulated(targetDb, startTime) {
   console.log("");
   console.log("[Postflight] Checking sym_change_log for new INSERT events...");
@@ -147,12 +170,6 @@ async function verifySyncLogPopulated(targetDb, startTime) {
   console.log("[Postflight] All tables have INSERT events in log ✅");
 }
 
-/**
- * Wait for the sync engine to propagate, then run node-copy --verify
- * to confirm all nodes are in parity.
- *
- * Optional — only runs if VERIFY_AFTER_MIGRATION=true is set in .env.
- */
 async function waitAndVerifyParity() {
   if (process.env.VERIFY_AFTER_MIGRATION !== "true") {
     console.log("");
@@ -258,19 +275,16 @@ async function runMigration() {
       `[Migration] Target DB: ${process.env.DB_TARGET_HOST}:${targetPort}/${process.env.DB_TARGET_DATABASE}`,
     );
 
-    // ─── NEW: pre-flight trigger & session checks ───
     await verifyTargetTriggers(targetDb);
     await verifySessionIsClean(targetDb);
 
-    // Record when the migration starts so postflight can filter log entries
     const migrationStartTime = new Date();
 
-    // Start database transaction on target DB
     await targetDb.beginTransaction();
 
-    // ----------------------------------------------------
-    // HELPERS: Batch + lookup utilities
-    // ----------------------------------------------------
+    /* ---------------------------------------------------- */
+    /* HELPERS                                              */
+    /* ---------------------------------------------------- */
     function chunk(array, size) {
       const chunks = [];
       for (let i = 0; i < array.length; i += size) {
@@ -347,18 +361,18 @@ async function runMigration() {
       return map.values().next().value;
     }
 
-    // ----------------------------------------------------
-    // STEP 1: FETCH ACTIVE PRODUCTS VIA SALES TRANSACTIONS
-    // ----------------------------------------------------
-    const [soldProducts] = await legacyDb.execute(
+    /* ---------------------------------------------------- */
+    /* STEP 1: FETCH + SANITIZE + DEDUPE PRODUCTS           */
+    /* ---------------------------------------------------- */
+    const [rawSoldProducts] = await legacyDb.execute(
       `
-      SELECT DISTINCT 
-        p.product_code, 
-        p.particular, 
-        pc.name as category_name, 
-        c.name as classification_name, 
-        pt.name as product_type_name, 
-        p.reorder_point, 
+      SELECT DISTINCT
+        p.product_code,
+        p.particular,
+        pc.name as category_name,
+        c.name as classification_name,
+        pt.name as product_type_name,
+        p.reorder_point,
         p.status as product_status
       FROM sales_order so
       JOIN sales_order_details sod ON so.record_id = sod.sales_order
@@ -371,21 +385,106 @@ async function runMigration() {
       [sourceStoreId],
     );
 
-    console.log(
-      `[Migration] Found ${soldProducts.length} unique products with sales history for this store. Provisioning catalog...`,
+    /* Report corruption found in the source BEFORE we clean it */
+    const corruptSourceRows = rawSoldProducts.filter(
+      (p) =>
+        p.product_code &&
+        (/\r|\n|\t|\\r|\\n/.test(p.product_code) ||
+          /^MUG\s*/i.test(p.product_code)),
     );
-
-    const productIdByCode = new Map();
-    if (soldProducts.length > 0) {
-      const placeholders = soldProducts.map(() => "?").join(",");
-      const [existingProducts] = await targetDb.execute(
-        `SELECT record_id, product_code FROM product WHERE product_code IN (${placeholders})`,
-        soldProducts.map((p) => p.product_code),
+    if (corruptSourceRows.length > 0) {
+      console.warn(
+        `[Sanitizer] Found ${corruptSourceRows.length} of ${rawSoldProducts.length} ` +
+          `legacy product_code(s) containing MUG/CR/literal-\\r corruption.`,
       );
-      for (const p of existingProducts) {
-        productIdByCode.set(p.product_code, p.record_id);
+      for (const p of corruptSourceRows.slice(0, 20)) {
+        const clean = sanitizeProductCode(p.product_code);
+        console.warn(
+          `  ⚠  ${JSON.stringify(p.product_code)}  →  ${JSON.stringify(clean)}` +
+            `  (${JSON.stringify(p.particular)})`,
+        );
+      }
+      if (corruptSourceRows.length > 20) {
+        console.warn(`  … and ${corruptSourceRows.length - 20} more.`);
       }
     }
+
+    /* Sanitize every row */
+    const sanitizedProducts = rawSoldProducts
+      .map((p) => {
+        try {
+          return sanitizeProductRow(p);
+        } catch (e) {
+          console.error(`[Sanitizer] ${e.message}`);
+          return null;
+        }
+      })
+      .filter(Boolean);
+
+    /* Re-dedupe: two legacy rows may collapse to the same clean code */
+    const seenCodes = new Map();
+    const soldProducts = [];
+    const collisions = [];
+    for (const p of sanitizedProducts) {
+      const existing = seenCodes.get(p.product_code);
+      if (existing) {
+        if (
+          String(existing.particular || "")
+            .trim()
+            .toLowerCase() !==
+          String(p.particular || "")
+            .trim()
+            .toLowerCase()
+        ) {
+          collisions.push({
+            code: p.product_code,
+            a: existing.particular,
+            b: p.particular,
+          });
+        }
+        continue;
+      }
+      seenCodes.set(p.product_code, p);
+      soldProducts.push(p);
+    }
+
+    if (collisions.length > 0) {
+      console.warn(
+        `[Sanitizer] ${collisions.length} product_code collision(s) after sanitization:`,
+      );
+      for (const c of collisions) {
+        console.warn(
+          `  ⚠  "${c.code}" — legacy particulars differ: ` +
+            `${JSON.stringify(c.a)} vs ${JSON.stringify(c.b)}`,
+        );
+      }
+      console.warn(
+        `[Sanitizer] Kept the first-seen particular per code. ` +
+          `Review after migration.`,
+      );
+    }
+
+    console.log(
+      `[Migration] Found ${rawSoldProducts.length} raw product row(s) ` +
+        `→ ${soldProducts.length} unique sanitized code(s). Provisioning catalog...`,
+    );
+
+    /* Preload existing target products by clean code */
+    const productIdByCode = new Map();
+    if (soldProducts.length > 0) {
+      // Query in chunks to avoid huge IN-list parameter limits
+      for (const batch of chunk(soldProducts, BATCH_SIZE)) {
+        const ph = batch.map(() => "?").join(",");
+        const [existing] = await targetDb.execute(
+          `SELECT record_id, product_code FROM product WHERE product_code IN (${ph})`,
+          batch.map((p) => p.product_code),
+        );
+        for (const p of existing) {
+          productIdByCode.set(p.product_code, p.record_id);
+        }
+      }
+    }
+
     const catMap = await loadNameMap("product_category");
     const classMap = await loadNameMap("classification");
     const typeMap = await loadNameMap("product_type");
@@ -454,15 +553,15 @@ async function runMigration() {
       `[Migration] Catalog provisioning completed. (${productsCreated} new products processed in batches of ${BATCH_SIZE})`,
     );
 
-    // ----------------------------------------------------
-    // STEP 2: SYNC PRICING SCHEMES
-    // ----------------------------------------------------
+    /* ---------------------------------------------------- */
+    /* STEP 2: SYNC PRICING SCHEMES                         */
+    /* ---------------------------------------------------- */
     const [legacyPricing] = await legacyDb.execute(
       `
-      SELECT 
-        p.product_code, 
-        ps.amount, 
-        ps.is_default, 
+      SELECT
+        p.product_code,
+        ps.amount,
+        ps.is_default,
         ps.status as pricing_status,
         pr.name as price_name,
         uom.name as uom_name
@@ -471,7 +570,7 @@ async function runMigration() {
       LEFT JOIN price pr ON ps.price = pr.record_id
       LEFT JOIN unit_of_measure uom ON ps.uom = uom.record_id
       WHERE ps.store = ? AND p.product_code IN (
-        SELECT DISTINCT p_sub.product_code 
+        SELECT DISTINCT p_sub.product_code
         FROM sales_order so_sub
         JOIN sales_order_details sod_sub ON so_sub.record_id = sod_sub.sales_order
         JOIN product p_sub ON sod_sub.product = p_sub.record_id
@@ -490,7 +589,9 @@ async function runMigration() {
 
     const pricingRows = [];
     for (const item of legacyPricing) {
-      const productUuid = productIdByCode.get(item.product_code);
+      /* Sanitize product_code before lookup — matches STEP 1 */
+      const cleanCode = sanitizeProductCode(item.product_code);
+      const productUuid = cleanCode ? productIdByCode.get(cleanCode) : null;
       if (!productUuid) continue;
 
       pricingRows.push({
@@ -502,13 +603,13 @@ async function runMigration() {
           priceMap,
           "price",
           item.price_name,
-          `pricing for ${item.product_code}`,
+          `pricing for ${cleanCode}`,
         ),
         uom: resolveUuid(
           uomMap,
           "unit_of_measure",
           item.uom_name,
-          `pricing for ${item.product_code}`,
+          `pricing for ${cleanCode}`,
         ),
         is_default: item.is_default,
         status: item.pricing_status ?? 1,
@@ -536,7 +637,7 @@ async function runMigration() {
         INSERT INTO pricing_scheme (
           record_id, product, store, amount, price, uom, is_default, status, created_at, updated_at
         ) VALUES ${placeholders}
-        ON DUPLICATE KEY UPDATE 
+        ON DUPLICATE KEY UPDATE
           amount = VALUES(amount),
           price = VALUES(price),
           uom = VALUES(uom),
@@ -552,19 +653,19 @@ async function runMigration() {
       `[Migration] Pricing sync completed. (${pricingSynced} records upserted in batches)`,
     );
 
-    // ----------------------------------------------------
-    // STEP 3: SYNC STOCKS ON HAND
-    // ----------------------------------------------------
+    /* ---------------------------------------------------- */
+    /* STEP 3: SYNC STOCKS ON HAND                          */
+    /* ---------------------------------------------------- */
     const [legacyStocks] = await legacyDb.execute(
       `
-      SELECT 
-        p.product_code, 
-        s.qty, 
+      SELECT
+        p.product_code,
+        s.qty,
         s.status as stock_status
       FROM stocks_on_hand s
       JOIN product p ON s.product = p.record_id
       WHERE s.store = ? AND p.product_code IN (
-        SELECT DISTINCT p_sub.product_code 
+        SELECT DISTINCT p_sub.product_code
         FROM sales_order so_sub
         JOIN sales_order_details sod_sub ON so_sub.record_id = sod_sub.sales_order
         JOIN product p_sub ON sod_sub.product = p_sub.record_id
@@ -580,7 +681,8 @@ async function runMigration() {
 
     const stockRows = [];
     for (const stock of legacyStocks) {
-      const productUuid = productIdByCode.get(stock.product_code);
+      const cleanCode = sanitizeProductCode(stock.product_code);
+      const productUuid = cleanCode ? productIdByCode.get(cleanCode) : null;
       if (!productUuid) continue;
 
       stockRows.push({
@@ -610,7 +712,7 @@ async function runMigration() {
         INSERT INTO stocks_on_hand (
           record_id, product, store, qty, status, last_updated, created_at, updated_at
         ) VALUES ${placeholders}
-        ON DUPLICATE KEY UPDATE 
+        ON DUPLICATE KEY UPDATE
           qty = VALUES(qty),
           status = VALUES(status),
           last_updated = NOW(),
@@ -624,9 +726,9 @@ async function runMigration() {
       `[Migration] Stocks sync completed successfully. (${stocksSynced} records upserted in batches)`,
     );
 
-    // ----------------------------------------------------
-    // COMMIT or ROLLBACK
-    // ----------------------------------------------------
+    /* ---------------------------------------------------- */
+    /* COMMIT or ROLLBACK                                   */
+    /* ---------------------------------------------------- */
     if (isDryRun) {
       console.log("--------------------------------------------------");
       console.log("🔄 Rolling back transaction (--dry-run detected)...");
@@ -635,14 +737,13 @@ async function runMigration() {
         "✨ DRY RUN FINISHED: All changes successfully rolled back. Database is clean.",
       );
       console.log("--------------------------------------------------");
-      return; // skip postflight for dry-run
+      return;
     }
 
     console.log("💾 Committing transaction to database...");
     await targetDb.commit();
     console.log("✨ LIVE MIGRATION COMMITTED SUCCESSFULLY.");
 
-    // ─── NEW: postflight — verify log populated, then optional parity ───
     await verifySyncLogPopulated(targetDb, migrationStartTime);
     await waitAndVerifyParity();
   } catch (error) {
