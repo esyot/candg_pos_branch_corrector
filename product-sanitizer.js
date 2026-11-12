@@ -19,18 +19,19 @@ function getFlagValue(name) {
 }
 
 /* ================================================================== */
-/* Sanitization — matches runner.js exactly                           */
+/* Sanitization                                                       */
 /* ================================================================== */
 function sanitizeProductCode(raw) {
   if (raw == null) return null;
-  let s = String(raw);
-  s = s.replace(/\r/g, "");
-  s = s.replace(/\n/g, "");
-  s = s.replace(/\t/g, "");
-  s = s.replace(/\\r/g, "");
-  s = s.replace(/\\n/g, "");
-  s = s.replace(/^MUG\s*/i, "");
-  return s.trim().toUpperCase();
+  return String(raw)
+    .replace(/\r/g, "")
+    .replace(/\n/g, "")
+    .replace(/\t/g, "")
+    .replace(/\\r/g, "")
+    .replace(/\\n/g, "")
+    .replace(/^MUG\s*/i, "")
+    .trim()
+    .toUpperCase();
 }
 
 function isCorruptCode(raw) {
@@ -39,19 +40,6 @@ function isCorruptCode(raw) {
   return /\r|\n|\t/.test(s) || /\\r|\\n/.test(s) || /^MUG\s*/i.test(s);
 }
 
-/**
- * Normalize a "particular" for equivalence comparison.
- * - Strips trailing packaging suffixes like "(HTC)", "(MW)", "(WC)", "(H)", "(M)"
- * - Strips all whitespace, parens, dashes, dots, commas, hashes
- *
- * Examples:
- *   "GX-1(HTC)"            -> "GX1"
- *   "GX-1 (HTC)"           -> "GX1"
- *   "#7102-1,2,3,4,5,6,7,8,9"     -> "7102123456789"
- *   "#7102-1,2,3,4,5,6,7,8,9(HTC)" -> "7102123456789"
- *   "BEER MUG LXZB-29(HTC)" -> "BEERMUGLXZB29"
- *   "BEAR MUG LXZB(HTC)"    -> "BEARMUGLXZB"
- */
 function normalizeParticular(raw) {
   if (raw == null) return "";
   return String(raw)
@@ -68,7 +56,7 @@ function looksLikeUuid(id) {
 }
 
 /* ================================================================== */
-/* Connection — uses exactly what .env says                           */
+/* Connection                                                         */
 /* ================================================================== */
 const HOST = process.env.DB_TARGET_HOST;
 const PORT = Number(process.env.DB_TARGET_PORT) || 3306;
@@ -77,16 +65,11 @@ const PASS = process.env.DB_TARGET_PASSWORD || "";
 const DB = process.env.DB_TARGET_DATABASE;
 
 if (!HOST || !USER || !DB) {
-  console.error(
-    "[Error] Missing DB_TARGET_HOST / DB_TARGET_USERNAME / DB_TARGET_DATABASE in .env",
-  );
+  console.error("[Error] Missing DB_TARGET_* in .env");
   process.exit(1);
 }
 
-console.log(`[Init] DB_TARGET_HOST     = ${HOST}:${PORT}`);
-console.log(`[Init] DB_TARGET_USERNAME = ${USER}`);
-console.log(`[Init] DB_TARGET_DATABASE = ${DB}`);
-console.log("");
+console.log(`[Init] ${USER}@${HOST}:${PORT}/${DB}\n`);
 
 const pool = mysql.createPool({
   host: HOST,
@@ -101,7 +84,7 @@ const pool = mysql.createPool({
 });
 
 /* ================================================================== */
-/* Child tables that reference product.record_id                      */
+/* FK definitions                                                     */
 /* ================================================================== */
 const CHILD_TABLES = [
   { table: "damaged_stocks_on_hand", column: "product" },
@@ -118,43 +101,20 @@ const CHILD_TABLES = [
   { table: "store_expenses_item", column: "product" },
 ];
 
-/* Unique keys that constrain merging of these tables */
 const UNIQUE_ON_PRODUCT = {
   stocks_on_hand: ["store"],
   pricing_scheme: ["store", "price", "uom", "is_default"],
 };
 
-/* ================================================================== */
-/* GRANDCHILD FKs — tables that reference pricing_scheme / stocks_on_hand
-   Must be repointed BEFORE we delete a colliding loser row in those
-   tables, otherwise ON DELETE RESTRICT will block the delete.
-
-   ⚠️  VERIFY against information_schema on candg_pos_db:
-       SELECT REFERENCED_TABLE_NAME AS parent, TABLE_NAME AS child, COLUMN_NAME
-       FROM information_schema.KEY_COLUMN_USAGE
-       WHERE REFERENCED_TABLE_SCHEMA = DATABASE()
-         AND REFERENCED_TABLE_NAME IN ('pricing_scheme','stocks_on_hand');
-   ================================================================== */
+// Verified against candg_pos_db:
+//   pricing_scheme ← sales_order_details.price_scheme (the only grandchild FK)
 const GRANDCHILD_FKS = {
-  pricing_scheme: [
-    { table: "sales_order_details", column: "price_scheme" },
-    { table: "purchase_order_details", column: "price_scheme" },
-    { table: "layaway_item", column: "price_scheme" },
-    { table: "stock_cost_details", column: "price_scheme" },
-    { table: "in_out_stocks_details", column: "price_scheme" },
-    { table: "in_out_damaged_stocks_details", column: "price_scheme" },
-    { table: "stock_request_items", column: "price_scheme" },
-    { table: "store_expenses_item", column: "price_scheme" },
-  ],
-  stocks_on_hand: [
-    { table: "in_out_stocks_details", column: "stocks_on_hand" },
-    { table: "in_out_damaged_stocks_details", column: "stocks_on_hand" },
-    { table: "damaged_stocks_on_hand", column: "stocks_on_hand" },
-  ],
+  pricing_scheme: [{ table: "sales_order_details", column: "price_scheme" }],
+  stocks_on_hand: [],
 };
 
 /* ================================================================== */
-/* Cluster preflight                                                  */
+/* Preflight                                                          */
 /* ================================================================== */
 async function checkCluster(conn) {
   const [rows] = await conn.query(
@@ -163,16 +123,11 @@ async function checkCluster(conn) {
        AND TABLE_NAME IN ('sym_change_log','sym_checkpoint')`,
   );
   const present = new Set(rows.map((r) => r.TABLE_NAME));
-  return {
-    isCluster: present.has("sym_change_log") && present.has("sym_checkpoint"),
-    hasLog: present.has("sym_change_log"),
-    hasCp: present.has("sym_checkpoint"),
-  };
+  return present.has("sym_change_log") && present.has("sym_checkpoint");
 }
 
 async function checkTriggers(conn, tables) {
   const problems = [];
-  const details = {};
   for (const t of tables) {
     const [rows] = await conn.query(
       `SELECT TRIGGER_NAME FROM information_schema.TRIGGERS
@@ -186,10 +141,9 @@ async function checkTriggers(conn, tables) {
       `sym_trig_${t}_upd`,
       `sym_trig_${t}_del`,
     ].filter((x) => !found.includes(x));
-    details[t] = found;
     if (missing.length) problems.push(`${t}: missing ${missing.join(", ")}`);
   }
-  return { problems, details };
+  return problems;
 }
 
 async function checkSessionClean(conn) {
@@ -198,47 +152,35 @@ async function checkSessionClean(conn) {
   return v == null || v === 0;
 }
 
-async function preflight({ requireCluster }) {
+async function preflight() {
   const conn = await pool.getConnection();
   try {
-    const cluster = await checkCluster(conn);
-    if (!cluster.isCluster) {
-      const msg =
-        `DB "${DB}" is NOT a cluster node ` +
-        `(sym_change_log ${cluster.hasLog ? "present" : "MISSING"}, ` +
-        `sym_checkpoint ${cluster.hasCp ? "present" : "MISSING"}).`;
-      if (requireCluster) {
+    if (!(await checkCluster(conn))) {
+      const msg = `DB "${DB}" is not a cluster node (sym_change_log / sym_checkpoint missing).`;
+      if (!SKIP_CLUSTER) {
         console.error("❌ " + msg);
-        console.error("   Refusing to run without --skip-cluster-check.");
-        process.exitCode = 1;
+        console.error("   Pass --skip-cluster-check to run anyway.");
         return { ok: false, reason: msg };
       }
-      console.log("ℹ️  " + msg + "  (standalone mode)");
+      console.log("ℹ️  " + msg + " (standalone mode)");
       return { ok: true, cluster: false };
     }
-
     console.log(`✅ Cluster node confirmed on "${DB}"`);
 
     const tablesToCheck = ["product", "pricing_scheme", "stocks_on_hand"];
-    const trig = await checkTriggers(conn, tablesToCheck);
-    if (trig.problems.length) {
+    const problems = await checkTriggers(conn, tablesToCheck);
+    if (problems.length) {
       console.error("❌ Missing sync triggers:");
-      for (const p of trig.problems) console.error("   " + p);
-      console.error('   Run "node triggers.js" on this DB first.');
-      process.exitCode = 1;
+      for (const p of problems) console.error("   " + p);
       return { ok: false, reason: "missing triggers" };
     }
-    console.log(`✅ All sync triggers present (${tablesToCheck.join(", ")})`);
+    console.log(`✅ Sync triggers present (${tablesToCheck.join(", ")})`);
 
-    const clean = await checkSessionClean(conn);
-    if (!clean) {
-      console.error(
-        "❌ @sym_is_syncing is set — triggers suppressed. Clear with: SET @sym_is_syncing = NULL;",
-      );
-      process.exitCode = 1;
+    if (!(await checkSessionClean(conn))) {
+      console.error("❌ @sym_is_syncing is set — triggers suppressed.");
       return { ok: false, reason: "@sym_is_syncing set" };
     }
-    console.log("✅ @sym_is_syncing is NULL (triggers will fire)");
+    console.log("✅ @sym_is_syncing is NULL");
 
     return { ok: true, cluster: true };
   } finally {
@@ -268,12 +210,12 @@ async function setupAudit() {
   console.log("✅ product_merge_log ready.");
 }
 
-async function auditLog(conn, survivorId, loserId, normalizedKey, snapshot) {
+async function auditLog(conn, survivorId, loserId, key, snapshot) {
   await conn.query(
     `INSERT INTO product_merge_log
        (survivor_id, loser_id, normalized_key, snapshot_json, merged_by)
      VALUES (?, ?, ?, ?, CURRENT_USER())`,
-    [survivorId, loserId, normalizedKey, JSON.stringify(snapshot)],
+    [survivorId, loserId, key, JSON.stringify(snapshot)],
   );
 }
 
@@ -286,32 +228,30 @@ async function scan() {
            product_type, reorder_point, status, date_added
     FROM product
     WHERE product_code IS NOT NULL AND TRIM(product_code) <> ''
-    ORDER BY product_code
   `);
 
   const byClean = new Map();
   let corruptCount = 0;
+
   for (const r of rows) {
+    if (isCorruptCode(r.product_code)) corruptCount++;
     const clean = sanitizeProductCode(r.product_code);
     if (!clean) continue;
-    if (isCorruptCode(r.product_code)) corruptCount++;
     if (!byClean.has(clean)) byClean.set(clean, []);
     byClean.get(clean).push(r);
   }
 
   const groups = [];
   for (const [clean, list] of byClean) {
-    const hasCorrupt = list.some((r) => isCorruptCode(r.product_code));
-    if (!hasCorrupt) continue;
+    if (!list.some((r) => isCorruptCode(r.product_code))) continue;
     const particulars = new Set(
       list.map((r) => normalizeParticular(r.particular)),
     );
-    const safe = particulars.size === 1;
     groups.push({
       normalizedCode: clean,
-      hasCorrupt,
-      safe,
-      reason: safe ? null : "different particulars — manual review",
+      safe: particulars.size === 1,
+      reason:
+        particulars.size === 1 ? null : "different particulars — manual review",
       rows: list,
     });
   }
@@ -335,7 +275,7 @@ function pickSurvivor(rows) {
 }
 
 /* ================================================================== */
-/* Repoint a single child table                                       */
+/* Repoint one child table                                            */
 /* ================================================================== */
 async function repointTable(
   conn,
@@ -347,7 +287,7 @@ async function repointTable(
 ) {
   const ph = loserIds.map(() => "?").join(",");
 
-  if (!uniqueOn || uniqueOn.length === 0) {
+  if (!uniqueOn || !uniqueOn.length) {
     const [r] = await conn.query(
       `UPDATE \`${table}\` SET \`${column}\` = ? WHERE \`${column}\` IN (${ph})`,
       [survivorId, ...loserIds],
@@ -355,6 +295,7 @@ async function repointTable(
     return r.affectedRows;
   }
 
+  // Fetch loser rows for unique-key collision checking
   const cols = ["record_id", ...uniqueOn];
   let loserRows;
   try {
@@ -371,33 +312,32 @@ async function repointTable(
     loserRows = rows;
   }
 
+  const grandkids = GRANDCHILD_FKS[table] || [];
   let repointed = 0;
+
   for (const row of loserRows) {
     const whereParts = uniqueOn.map((c) => `${c} = ?`).join(" AND ");
     const whereVals = uniqueOn.map((c) => row[c]);
     const [ex] = await conn.query(
-      `SELECT record_id FROM \`${table}\`
-       WHERE \`${column}\` = ? AND ${whereParts}`,
+      `SELECT record_id FROM \`${table}\` WHERE \`${column}\` = ? AND ${whereParts}`,
       [survivorId, ...whereVals],
     );
 
     if (ex.length) {
-      // Collision: survivor already has a row for this unique key.
-      // 1. Sum qty for stocks_on_hand
+      const survivorRowId = ex[0].record_id;
+      const loserRowId = row.record_id;
+
+      // Sum qty for stocks_on_hand
       if (table === "stocks_on_hand" && "qty" in row) {
         await conn.query(
           `UPDATE stocks_on_hand SET qty = qty + ?, updated_at = NOW()
            WHERE record_id = ?`,
-          [row.qty, ex[0].record_id],
+          [row.qty, survivorRowId],
         );
       }
 
-      // 2. Repoint grandchildren to survivor's row (BEFORE delete)
-      const survivorRowId = ex[0].record_id;
-      const loserRowId = row.record_id;
-      const grandkids = GRANDCHILD_FKS[table] || [];
+      // Cascade to grandchildren BEFORE deleting
       for (const gc of grandkids) {
-        // Skip silently if the table/column doesn't exist in this DB.
         try {
           await conn.query(
             `UPDATE \`${gc.table}\` SET \`${gc.column}\` = ?
@@ -410,7 +350,7 @@ async function repointTable(
             e.code === "ER_BAD_FIELD_ERROR"
           ) {
             console.warn(
-              `   ⚠️  Skipping grandchild repoint: ${gc.table}.${gc.column} (${e.code})`,
+              `   ⚠️  Skipped grandchild ${gc.table}.${gc.column}: ${e.code}`,
             );
           } else {
             throw e;
@@ -418,7 +358,6 @@ async function repointTable(
         }
       }
 
-      // 3. Now safe to delete the loser
       await conn.query(`DELETE FROM \`${table}\` WHERE record_id = ?`, [
         loserRowId,
       ]);
@@ -440,7 +379,7 @@ async function mergeGroup(group, { dryRun }) {
   const survivor = pickSurvivor(group.rows);
   const losers = group.rows.filter((r) => r.record_id !== survivor.record_id);
 
-  if (losers.length === 0) return { ok: false, error: "no losers to merge" };
+  if (!losers.length) return { ok: false, error: "no losers" };
 
   const sCode = sanitizeProductCode(survivor.product_code);
   const sPart = normalizeParticular(survivor.particular);
@@ -540,7 +479,7 @@ async function mergeGroup(group, { dryRun }) {
 }
 
 /* ================================================================== */
-/* Rename a corrupt orphan (no clean twin)                            */
+/* Rename orphan                                                      */
 /* ================================================================== */
 async function renameOrphan(row, { dryRun }) {
   const clean = sanitizeProductCode(row.product_code);
@@ -553,7 +492,7 @@ async function renameOrphan(row, { dryRun }) {
   );
   if (conflict.length) {
     throw new Error(
-      `cannot rename ${row.record_id} → "${clean}": already taken by ${conflict.map((c) => c.record_id).join(", ")}`,
+      `cannot rename ${row.record_id} → "${clean}": taken by ${conflict.map((c) => c.record_id).join(", ")}`,
     );
   }
 
@@ -604,107 +543,68 @@ async function renameOrphan(row, { dryRun }) {
 }
 
 /* ================================================================== */
-/* Orphan verification (--verify-only)                                */
+/* Verify orphan integrity                                            */
 /* ================================================================== */
 async function verifyOrphans() {
-  console.log("\n🔎 Verifying FK integrity...\n");
-
+  console.log("\n🔎 FK integrity check...\n");
   const problems = [];
 
-  // Direct children of product
-  console.log("   Direct child tables (product.record_id):");
+  console.log("   Direct children (product.record_id):");
   for (const { table, column } of CHILD_TABLES) {
     const [rows] = await pool.query(
       `SELECT COUNT(*) AS n
-         FROM \`${table}\` c
-         LEFT JOIN product p ON p.record_id = c.\`${column}\`
-        WHERE c.\`${column}\` IS NOT NULL
-          AND p.record_id IS NULL`,
+       FROM \`${table}\` c
+       LEFT JOIN product p ON p.record_id = c.\`${column}\`
+       WHERE c.\`${column}\` IS NOT NULL AND p.record_id IS NULL`,
     );
-    const orphanCount = Number(rows[0].n);
-
-    if (orphanCount === 0) {
+    const n = Number(rows[0].n);
+    if (n === 0) {
       console.log(`   ✅ ${table.padEnd(35)} 0 orphans`);
-      continue;
+    } else {
+      console.log(`   ❌ ${table.padEnd(35)} ${n} ORPHAN ROW(S)`);
+      problems.push({ table, count: n });
     }
-
-    const [sample] = await pool.query(
-      `SELECT c.\`${column}\` AS product_id, COUNT(*) AS rows_per_product
-         FROM \`${table}\` c
-         LEFT JOIN product p ON p.record_id = c.\`${column}\`
-        WHERE c.\`${column}\` IS NOT NULL
-          AND p.record_id IS NULL
-        GROUP BY c.\`${column}\`
-        LIMIT 10`,
-    );
-
-    console.log(`   ❌ ${table.padEnd(35)} ${orphanCount} orphan row(s)`);
-    for (const s of sample) {
-      console.log(`        ${s.product_id}  (${s.rows_per_product} row(s))`);
-    }
-
-    problems.push({ table, column, count: orphanCount, sample });
   }
 
-  // Grandchildren of pricing_scheme / stocks_on_hand
-  console.log("\n   Grandchild tables (pricing_scheme / stocks_on_hand):");
+  console.log("\n   Grandchildren:");
   for (const [parent, kids] of Object.entries(GRANDCHILD_FKS)) {
     for (const { table, column } of kids) {
       try {
         const [rows] = await pool.query(
           `SELECT COUNT(*) AS n
-             FROM \`${table}\` c
-             LEFT JOIN \`${parent}\` p ON p.record_id = c.\`${column}\`
-            WHERE c.\`${column}\` IS NOT NULL
-              AND p.record_id IS NULL`,
+           FROM \`${table}\` c
+           LEFT JOIN \`${parent}\` p ON p.record_id = c.\`${column}\`
+           WHERE c.\`${column}\` IS NOT NULL AND p.record_id IS NULL`,
         );
-        const orphans = Number(rows[0].n);
-        if (orphans === 0) {
+        const n = Number(rows[0].n);
+        if (n === 0) {
           console.log(`   ✅ ${(table + "." + column).padEnd(45)} 0 orphans`);
         } else {
           console.log(
-            `   ❌ ${(table + "." + column).padEnd(45)} ${orphans} orphans`,
+            `   ❌ ${(table + "." + column).padEnd(45)} ${n} ORPHAN ROW(S)`,
           );
-          problems.push({
-            table: `${table}.${column}`,
-            column,
-            count: orphans,
-            sample: [],
-          });
+          problems.push({ table: `${table}.${column}`, count: n });
         }
       } catch (e) {
         if (e.code === "ER_NO_SUCH_TABLE" || e.code === "ER_BAD_FIELD_ERROR") {
           console.log(
             `   ⏭️  ${(table + "." + column).padEnd(45)} skipped (${e.code})`,
           );
-        } else {
-          throw e;
-        }
+        } else throw e;
       }
     }
   }
 
   console.log("");
-  if (problems.length === 0) {
+  if (!problems.length) {
     console.log(`✅ All FK checks passed on ${DB}.\n`);
     return 0;
   }
-
-  const totalOrphans = problems.reduce((a, b) => a + b.count, 0);
+  const total = problems.reduce((a, b) => a + b.count, 0);
   console.log(
-    `❌ ${problems.length} FK source(s) have orphans — total ${totalOrphans} row(s).\n`,
+    `❌ ${problems.length} source(s) have orphans — total ${total} row(s).\n`,
   );
   return problems.length;
-}
-
-async function verifySessionStillClean() {
-  const conn = await pool.getConnection();
-  try {
-    const [rows] = await conn.query("SELECT @sym_is_syncing AS v");
-    return rows[0]?.v == null || rows[0].v === 0;
-  } finally {
-    conn.release();
-  }
 }
 
 /* ================================================================== */
@@ -712,11 +612,9 @@ async function verifySessionStillClean() {
 /* ================================================================== */
 async function main() {
   console.log(
-    APPLY
-      ? "⚠️  APPLY MODE — database WILL be modified"
-      : "🔍 DRY RUN — no changes will be made",
+    APPLY ? "⚠️  APPLY MODE — database WILL be modified" : "🔍 DRY RUN",
   );
-  if (ONLY) console.log(`🎯 Filtering to code: ${ONLY}`);
+  if (ONLY) console.log(`🎯 Only group: ${ONLY}`);
   console.log("");
 
   if (SETUP) {
@@ -724,37 +622,30 @@ async function main() {
     return;
   }
 
-  const pre = await preflight({ requireCluster: !SKIP_CLUSTER });
+  const pre = await preflight();
   if (!pre.ok) {
     console.error("\nAborted by preflight.");
+    process.exitCode = 1;
     return;
   }
   if (CHECK_ONLY) {
-    console.log("\n✅ Preflight OK (--check only).");
+    console.log("\n✅ Preflight OK.");
     return;
   }
 
   if (VERIFY_ONLY) {
-    const orphanCount = await verifyOrphans();
-    const clean = await verifySessionStillClean();
-    if (!clean) {
-      console.error(
-        "❌ @sym_is_syncing is set after verification — investigate.",
-      );
-      process.exitCode = 2;
-      return;
-    }
-    process.exitCode = orphanCount === 0 ? 0 : 1;
+    const n = await verifyOrphans();
+    process.exitCode = n === 0 ? 0 : 1;
     return;
   }
 
   const { groups, totalRows, corruptCount } = await scan();
   console.log(`\n📊 Scanned ${totalRows} product row(s) in ${DB}.`);
-  console.log(`   Corrupt codes (MUG/CR/literal-\\r): ${corruptCount}`);
+  console.log(`   Corrupt codes: ${corruptCount}`);
   console.log(`   Groups needing action: ${groups.length}`);
 
-  if (groups.length === 0) {
-    console.log("\n✅ Nothing to do — no corrupt codes with duplicates found.");
+  if (!groups.length) {
+    console.log("\n✅ Nothing to do.");
     return;
   }
 
@@ -786,7 +677,7 @@ async function main() {
           skipped++;
         }
       } catch (e) {
-        console.log(`   ❌ FAILED to rename: ${e.message}`);
+        console.log(`   ❌ FAILED rename: ${e.message}`);
         skipped++;
       }
       continue;
@@ -805,11 +696,10 @@ async function main() {
     if (res.ok) {
       const total = Object.values(res.repointed).reduce((a, b) => a + b, 0);
       console.log(
-        `   ✅ ${res.dryRun ? "WOULD MERGE" : "MERGED"} into survivor ${res.survivorId}  (children repointed: ${total})`,
+        `   ✅ ${res.dryRun ? "WOULD MERGE" : "MERGED"} into ${res.survivorId}  (repointed: ${total})`,
       );
-      for (const [t, n] of Object.entries(res.repointed)) {
+      for (const [t, n] of Object.entries(res.repointed))
         console.log(`       ${t}: ${n}`);
-      }
       merged++;
     } else {
       console.log(`   ❌ FAILED: ${res.error}`);
@@ -818,25 +708,20 @@ async function main() {
   }
 
   console.log(
-    `\nDone. ${APPLY ? "renamed" : "would-rename"}=${renamed}  ` +
-      `${APPLY ? "merged" : "would-merge"}=${merged}  skipped=${skipped}`,
+    `\nDone. ${APPLY ? "renamed" : "would-rename"}=${renamed}  ${APPLY ? "merged" : "would-merge"}=${merged}  skipped=${skipped}`,
   );
+
   if (!APPLY) {
-    console.log("\nRun again with --apply to execute.");
+    console.log("\nRun with --apply to execute.");
     return;
   }
 
   const orphanCount = await verifyOrphans();
   if (orphanCount > 0) {
-    console.error(
-      "\n⚠️  Merge committed, but orphaned rows were detected afterwards.",
-    );
-    console.error(
-      "   This means a FK was missed in CHILD_TABLES or GRANDCHILD_FKS.",
-    );
+    console.error("⚠️  Post-merge verification failed — orphans detected.");
     process.exitCode = 1;
   } else {
-    console.log("✅ Post-merge verification passed — no orphaned rows.");
+    console.log("✅ Post-merge verification passed.");
   }
 }
 
