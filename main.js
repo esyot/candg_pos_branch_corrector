@@ -46,6 +46,12 @@ function sanitizeProductRow(item) {
   return { ...item, product_code: clean };
 }
 
+function isCorruptCode(raw) {
+  if (raw == null || raw === "") return false;
+  const s = String(raw);
+  return /\r|\n|\t/.test(s) || /\\r|\\n/.test(s) || /^MUG\s*/i.test(s);
+}
+
 /* ------------------------------------------------------------------ */
 /* Pre-flight / post-flight helpers                                   */
 /* ------------------------------------------------------------------ */
@@ -220,6 +226,7 @@ async function waitAndVerifyParity() {
 async function runMigration() {
   const isDryRun = process.argv.includes("--dry-run");
   const allowFallback = process.argv.includes("--allow-fallback");
+  const allowHardCollisions = process.argv.includes("--allow-hard-collisions");
   const sourceStoreId = process.env.SOURCE_STORE_RECORD_ID;
   const targetStoreUuid = process.env.TARGET_STORE_RECORD_ID;
 
@@ -421,46 +428,105 @@ async function runMigration() {
       })
       .filter(Boolean);
 
-    /* Re-dedupe: two legacy rows may collapse to the same clean code */
-    const seenCodes = new Map();
-    const soldProducts = [];
-    const collisions = [];
+    /* Re-dedupe: two legacy rows may collapse to the same clean code.
+       Track ALL particulars per clean code so we can distinguish
+       soft collisions (same particular) from hard collisions
+       (different particulars — data loss risk!). */
+    const cleanCodeToRows = new Map(); // clean -> [ { product_code, particular, ... } ]
     for (const p of sanitizedProducts) {
-      const existing = seenCodes.get(p.product_code);
-      if (existing) {
-        if (
-          String(existing.particular || "")
-            .trim()
-            .toLowerCase() !==
-          String(p.particular || "")
-            .trim()
-            .toLowerCase()
-        ) {
-          collisions.push({
-            code: p.product_code,
-            a: existing.particular,
-            b: p.particular,
-          });
-        }
-        continue;
-      }
-      seenCodes.set(p.product_code, p);
-      soldProducts.push(p);
+      if (!cleanCodeToRows.has(p.product_code))
+        cleanCodeToRows.set(p.product_code, []);
+      cleanCodeToRows.get(p.product_code).push(p);
     }
 
-    if (collisions.length > 0) {
-      console.warn(
-        `[Sanitizer] ${collisions.length} product_code collision(s) after sanitization:`,
+    const softCollisions = [];
+    const hardCollisions = [];
+    const soldProducts = [];
+
+    for (const [clean, rows] of cleanCodeToRows) {
+      const distinctParticulars = new Set(
+        rows.map((r) =>
+          String(r.particular || "")
+            .trim()
+            .toLowerCase(),
+        ),
       );
-      for (const c of collisions) {
+
+      if (rows.length > 1 && distinctParticulars.size > 1) {
+        // HARD collision — two distinct products collapsing to one code
+        hardCollisions.push({
+          clean,
+          rows: rows.map((r) => ({
+            product_code: r.product_code,
+            particular: r.particular,
+          })),
+        });
+        // Keep first-seen (will be blocked unless --allow-hard-collisions)
+        soldProducts.push(rows[0]);
+      } else if (rows.length > 1) {
+        // SOFT collision — same product, different raw forms. Safe.
+        softCollisions.push({
+          clean,
+          rawForms: [...new Set(rows.map((r) => r.product_code))],
+        });
+        soldProducts.push(rows[0]);
+      } else {
+        soldProducts.push(rows[0]);
+      }
+    }
+
+    if (softCollisions.length > 0) {
+      console.warn(
+        `[Sanitizer] ${softCollisions.length} soft collision(s) — same particular, different raw form (safe, keeping first):`,
+      );
+      for (const c of softCollisions) {
         console.warn(
-          `  ⚠  "${c.code}" — legacy particulars differ: ` +
-            `${JSON.stringify(c.a)} vs ${JSON.stringify(c.b)}`,
+          `  ℹ  "${c.clean}" from ${c.rawForms.length} raw form(s): ${c.rawForms.map((x) => JSON.stringify(x)).join(", ")}`,
         );
       }
-      console.warn(
-        `[Sanitizer] Kept the first-seen particular per code. ` +
-          `Review after migration.`,
+    }
+
+    if (hardCollisions.length > 0) {
+      console.error("");
+      console.error(
+        "================================================================",
+      );
+      console.error(
+        `[Sanitizer] ❌ ${hardCollisions.length} HARD COLLISION(S) — data loss risk!`,
+      );
+      console.error(
+        "================================================================",
+      );
+      for (const c of hardCollisions) {
+        console.error(`  Code "${c.clean}":`);
+        for (const r of c.rows) {
+          console.error(
+            `    raw="${r.product_code}"  particular=${JSON.stringify(r.particular)}`,
+          );
+        }
+      }
+      console.error("");
+      console.error(
+        `These ${hardCollisions.length} clean code(s) would collapse distinct products into one.`,
+      );
+      console.error(
+        `Runner keeps the first-seen particular per code — the others are dropped.`,
+      );
+      console.error("");
+      console.error(
+        `Fix in the SOURCE DB first (give the extras distinct product_codes), OR`,
+      );
+      console.error(`re-run with --allow-hard-collisions to accept the loss.`);
+      console.error("");
+
+      if (!allowHardCollisions) {
+        throw new Error(
+          `[Sanitizer] Aborting — ${hardCollisions.length} hard product_code collision(s). ` +
+            `Fix source or pass --allow-hard-collisions.`,
+        );
+      }
+      console.error(
+        `[Sanitizer] ⚠️  --allow-hard-collisions set — proceeding (first-seen particular wins).`,
       );
     }
 
@@ -472,7 +538,6 @@ async function runMigration() {
     /* Preload existing target products by clean code */
     const productIdByCode = new Map();
     if (soldProducts.length > 0) {
-      // Query in chunks to avoid huge IN-list parameter limits
       for (const batch of chunk(soldProducts, BATCH_SIZE)) {
         const ph = batch.map(() => "?").join(",");
         const [existing] = await targetDb.execute(
@@ -589,7 +654,6 @@ async function runMigration() {
 
     const pricingRows = [];
     for (const item of legacyPricing) {
-      /* Sanitize product_code before lookup — matches STEP 1 */
       const cleanCode = sanitizeProductCode(item.product_code);
       const productUuid = cleanCode ? productIdByCode.get(cleanCode) : null;
       if (!productUuid) continue;
