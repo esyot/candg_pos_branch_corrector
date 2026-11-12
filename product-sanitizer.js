@@ -39,10 +39,24 @@ function isCorruptCode(raw) {
   return /\r|\n|\t/.test(s) || /\\r|\\n/.test(s) || /^MUG\s*/i.test(s);
 }
 
+/**
+ * Normalize a "particular" for equivalence comparison.
+ * - Strips trailing packaging suffixes like "(HTC)", "(MW)", "(WC)", "(H)", "(M)"
+ * - Strips all whitespace, parens, dashes, dots, commas, hashes
+ *
+ * Examples:
+ *   "GX-1(HTC)"            -> "GX1"
+ *   "GX-1 (HTC)"           -> "GX1"
+ *   "#7102-1,2,3,4,5,6,7,8,9"     -> "7102123456789"
+ *   "#7102-1,2,3,4,5,6,7,8,9(HTC)" -> "7102123456789"
+ *   "BEER MUG LXZB-29(HTC)" -> "BEERMUGLXZB29"
+ *   "BEAR MUG LXZB(HTC)"    -> "BEARMUGLXZB"
+ */
 function normalizeParticular(raw) {
   if (raw == null) return "";
   return String(raw)
     .toUpperCase()
+    .replace(/\s*\((?:HTC|MW|WC|H|M)\)\s*$/gi, "")
     .replace(/[\s()\-.,#]/g, "");
 }
 
@@ -54,7 +68,7 @@ function looksLikeUuid(id) {
 }
 
 /* ================================================================== */
-/* Connection — uses exactly what .env says, no defaults, no checks   */
+/* Connection — uses exactly what .env says                           */
 /* ================================================================== */
 const HOST = process.env.DB_TARGET_HOST;
 const PORT = Number(process.env.DB_TARGET_PORT) || 3306;
@@ -104,9 +118,39 @@ const CHILD_TABLES = [
   { table: "store_expenses_item", column: "product" },
 ];
 
+/* Unique keys that constrain merging of these tables */
 const UNIQUE_ON_PRODUCT = {
   stocks_on_hand: ["store"],
   pricing_scheme: ["store", "price", "uom", "is_default"],
+};
+
+/* ================================================================== */
+/* GRANDCHILD FKs — tables that reference pricing_scheme / stocks_on_hand
+   Must be repointed BEFORE we delete a colliding loser row in those
+   tables, otherwise ON DELETE RESTRICT will block the delete.
+
+   ⚠️  VERIFY against information_schema on candg_pos_db:
+       SELECT REFERENCED_TABLE_NAME AS parent, TABLE_NAME AS child, COLUMN_NAME
+       FROM information_schema.KEY_COLUMN_USAGE
+       WHERE REFERENCED_TABLE_SCHEMA = DATABASE()
+         AND REFERENCED_TABLE_NAME IN ('pricing_scheme','stocks_on_hand');
+   ================================================================== */
+const GRANDCHILD_FKS = {
+  pricing_scheme: [
+    { table: "sales_order_details", column: "price_scheme" },
+    { table: "purchase_order_details", column: "price_scheme" },
+    { table: "layaway_item", column: "price_scheme" },
+    { table: "stock_cost_details", column: "price_scheme" },
+    { table: "in_out_stocks_details", column: "price_scheme" },
+    { table: "in_out_damaged_stocks_details", column: "price_scheme" },
+    { table: "stock_request_items", column: "price_scheme" },
+    { table: "store_expenses_item", column: "price_scheme" },
+  ],
+  stocks_on_hand: [
+    { table: "in_out_stocks_details", column: "stocks_on_hand" },
+    { table: "in_out_damaged_stocks_details", column: "stocks_on_hand" },
+    { table: "damaged_stocks_on_hand", column: "stocks_on_hand" },
+  ],
 };
 
 /* ================================================================== */
@@ -338,6 +382,8 @@ async function repointTable(
     );
 
     if (ex.length) {
+      // Collision: survivor already has a row for this unique key.
+      // 1. Sum qty for stocks_on_hand
       if (table === "stocks_on_hand" && "qty" in row) {
         await conn.query(
           `UPDATE stocks_on_hand SET qty = qty + ?, updated_at = NOW()
@@ -345,8 +391,36 @@ async function repointTable(
           [row.qty, ex[0].record_id],
         );
       }
+
+      // 2. Repoint grandchildren to survivor's row (BEFORE delete)
+      const survivorRowId = ex[0].record_id;
+      const loserRowId = row.record_id;
+      const grandkids = GRANDCHILD_FKS[table] || [];
+      for (const gc of grandkids) {
+        // Skip silently if the table/column doesn't exist in this DB.
+        try {
+          await conn.query(
+            `UPDATE \`${gc.table}\` SET \`${gc.column}\` = ?
+             WHERE \`${gc.column}\` = ?`,
+            [survivorRowId, loserRowId],
+          );
+        } catch (e) {
+          if (
+            e.code === "ER_NO_SUCH_TABLE" ||
+            e.code === "ER_BAD_FIELD_ERROR"
+          ) {
+            console.warn(
+              `   ⚠️  Skipping grandchild repoint: ${gc.table}.${gc.column} (${e.code})`,
+            );
+          } else {
+            throw e;
+          }
+        }
+      }
+
+      // 3. Now safe to delete the loser
       await conn.query(`DELETE FROM \`${table}\` WHERE record_id = ?`, [
-        row.record_id,
+        loserRowId,
       ]);
     } else {
       await conn.query(
@@ -533,10 +607,12 @@ async function renameOrphan(row, { dryRun }) {
 /* Orphan verification (--verify-only)                                */
 /* ================================================================== */
 async function verifyOrphans() {
-  console.log("\n🔎 Verifying FK integrity across all child tables...\n");
+  console.log("\n🔎 Verifying FK integrity...\n");
 
   const problems = [];
 
+  // Direct children of product
+  console.log("   Direct child tables (product.record_id):");
   for (const { table, column } of CHILD_TABLES) {
     const [rows] = await pool.query(
       `SELECT COUNT(*) AS n
@@ -570,17 +646,53 @@ async function verifyOrphans() {
     problems.push({ table, column, count: orphanCount, sample });
   }
 
+  // Grandchildren of pricing_scheme / stocks_on_hand
+  console.log("\n   Grandchild tables (pricing_scheme / stocks_on_hand):");
+  for (const [parent, kids] of Object.entries(GRANDCHILD_FKS)) {
+    for (const { table, column } of kids) {
+      try {
+        const [rows] = await pool.query(
+          `SELECT COUNT(*) AS n
+             FROM \`${table}\` c
+             LEFT JOIN \`${parent}\` p ON p.record_id = c.\`${column}\`
+            WHERE c.\`${column}\` IS NOT NULL
+              AND p.record_id IS NULL`,
+        );
+        const orphans = Number(rows[0].n);
+        if (orphans === 0) {
+          console.log(`   ✅ ${(table + "." + column).padEnd(45)} 0 orphans`);
+        } else {
+          console.log(
+            `   ❌ ${(table + "." + column).padEnd(45)} ${orphans} orphans`,
+          );
+          problems.push({
+            table: `${table}.${column}`,
+            column,
+            count: orphans,
+            sample: [],
+          });
+        }
+      } catch (e) {
+        if (e.code === "ER_NO_SUCH_TABLE" || e.code === "ER_BAD_FIELD_ERROR") {
+          console.log(
+            `   ⏭️  ${(table + "." + column).padEnd(45)} skipped (${e.code})`,
+          );
+        } else {
+          throw e;
+        }
+      }
+    }
+  }
+
   console.log("");
   if (problems.length === 0) {
-    console.log(
-      `✅ All ${CHILD_TABLES.length} child tables have zero orphan rows on ${DB}.\n`,
-    );
+    console.log(`✅ All FK checks passed on ${DB}.\n`);
     return 0;
   }
 
   const totalOrphans = problems.reduce((a, b) => a + b.count, 0);
   console.log(
-    `❌ ${problems.length} child table(s) have orphans — total ${totalOrphans} row(s).\n`,
+    `❌ ${problems.length} FK source(s) have orphans — total ${totalOrphans} row(s).\n`,
   );
   return problems.length;
 }
@@ -717,17 +829,14 @@ async function main() {
   const orphanCount = await verifyOrphans();
   if (orphanCount > 0) {
     console.error(
-      "\n⚠️  Merge committed, but orphaned child rows were detected afterwards.",
+      "\n⚠️  Merge committed, but orphaned rows were detected afterwards.",
     );
     console.error(
-      "   This means a child table NOT in CHILD_TABLES referenced the losers,",
-    );
-    console.error(
-      "   OR the transaction partially succeeded (shouldn't happen).",
+      "   This means a FK was missed in CHILD_TABLES or GRANDCHILD_FKS.",
     );
     process.exitCode = 1;
   } else {
-    console.log("✅ Post-merge verification passed — no orphaned children.");
+    console.log("✅ Post-merge verification passed — no orphaned rows.");
   }
 }
 
